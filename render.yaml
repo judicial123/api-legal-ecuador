@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: api-legal-flask
+    runtime: python
+    buildCommand: ""
+    startCommand: "python app.py"
+    envVars:
+      - key: OPENAI_API_KEY
+        value: REEMPLAZAR_EN_RENDER
+      - key: PINECONE_API_KEY
+        value: REEMPLAZAR_EN_RENDER
+      - key: PINECONE_ENV
+        value: us-east-1-aws
+      - key: INDEX_NAME
+        value: indice-legal-ecuador

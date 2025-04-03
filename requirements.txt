@@ -1,0 +1,7 @@
+flask==3.1.0
+openai==1.70.0
+pinecone==6.0.2
+llama-index==0.9.48
+tqdm==4.67.1
+nest-asyncio==1.6.0
+python-dotenv==1.1.0
