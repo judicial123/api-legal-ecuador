@@ -86,7 +86,14 @@ Responde de forma profesional y estructurada:
         max_tokens=CONFIG["MAX_TOKENS"]
     )
 
-    return response.choices[0].message.content
+    return {
+        "respuesta": response.choices[0].message.content,
+        "tokens_usados": {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens
+        }
+    }
 
 @app.route("/query", methods=["POST"])
 def handle_query():
@@ -136,10 +143,17 @@ def handle_query():
         if not context_docs:
             return jsonify({
                 "respuesta": "No encontré normativa aplicable. No me baso en ningún artículo.",
-                "articulos_referenciados": []
+                "articulos_referenciados": [],
+                "tokens_usados": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0
+                }
             })
 
-        respuesta = generate_legal_response(question, context_docs)
+        respuesta_obj = generate_legal_response(question, context_docs)
+        respuesta = respuesta_obj["respuesta"]
+        tokens_usados = respuesta_obj["tokens_usados"]
 
         articulos_texto = context_docs[:MAX_ARTICULOS_CON_TEXTO]
         textos_adicionales = "\n\n📚 Otros artículos relacionados:\n"
@@ -154,7 +168,8 @@ def handle_query():
 
         return jsonify({
             "respuesta": respuesta,
-            "articulos_referenciados": todos_articulos
+            "articulos_referenciados": todos_articulos,
+            "tokens_usados": tokens_usados
         })
 
     except Exception as e:
