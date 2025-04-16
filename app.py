@@ -59,14 +59,16 @@ index = VectorStoreIndex.from_vector_store(
 )
 
 def generate_legal_response(question, context_docs):
-    system_prompt = """Eres un abogado especialista en derecho ecuatoriano. Tu trabajo es responder únicamente con base en los documentos legales proporcionados. No debes inventar información, ni usar conocimientos externos.
+    system_prompt = """Eres un abogado especialista en derecho ecuatoriano. Tu trabajo es responder únicamente con base en los documentos legales proporcionados. No debes inventar información ni usar conocimientos externos.
 
-Responde de forma profesional y estructurada:
+Responde con el siguiente formato:
 
-1. Explicación legal clara y directa (basada exclusivamente en los documentos).
-2. Lista de artículos aplicables (número y código).
-3. Citas textuales relevantes del texto legal.
-4. Cierra con: "Me baso en [artículos citados]".
+1. Primer párrafo: Redacta como abogado con criterio profesional. Expón tu razonamiento legal de forma clara, orientadora, empática y fundamentada. Puedes usar frases como: “En Ecuador, la ley establece que...”, “En este tipo de casos, lo habitual es que...”, “Desde el punto de vista jurídico...”.
+
+2. Respuesta estructurada:
+   - Lista de artículos aplicables (número y código).
+   - Citas textuales relevantes del texto legal.
+   - Cierra con: "Me baso en [artículos citados]".
 
 ⚠️ Si no encuentras la respuesta en los documentos, responde: "No encontré normativa aplicable. No me baso en ningún artículo."
 """
@@ -95,6 +97,7 @@ Responde de forma profesional y estructurada:
         }
     }
 
+
 @app.route("/query", methods=["POST"])
 def handle_query():
     try:
@@ -118,15 +121,12 @@ def handle_query():
 
         context_docs = []
         for node in pinecone_response.source_nodes:
-            if hasattr(node, "score") and node.score < SIMILARITY_THRESHOLD:
-                continue
-
             metadata = getattr(node.node, 'metadata', {})
             codigo = metadata.get('code', '')
             articulo = metadata.get('article', '')
             texto = getattr(node.node, 'text', '') or metadata.get("text", '')
 
-            if articulo_buscado:
+            if articulo_buscado and codigo_buscado:
                 if articulo == articulo_buscado and normalizar(codigo) == codigo_buscado:
                     context_docs.append({
                         "codigo": codigo,
