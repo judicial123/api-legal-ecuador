@@ -24,51 +24,59 @@ CONFIG = {
     "MAX_TOKENS": 1500
 }
 
-MATH_KEYWORDS = ['calcular', 'cálculo', 'fórmula', 'sumar', 'restar', 'multiplicar', 'dividir']
-TOP_K_RESULTS = 15
+TOP_K_RESULTS = 20
+MAX_DOCS_TO_OPENAI = 6
+MAX_TEXT_CHARS = 600  # <--- Aquí limitamos a OpenAI
 
-# ======================= UTILIDADES =======================
+MATH_KEYWORDS = ['calcular', 'cálculo', 'fórmula', 'sumar', 'restar', 'multiplicar', 'dividir']
+
+# ======================= UTILS =======================
 def normalizar(texto):
     return ''.join(
         c for c in unicodedata.normalize('NFD', texto)
         if unicodedata.category(c) != 'Mn'
     ).lower()
 
-# ======================= FLASK APP =======================
+# ======================= APP =======================
 app = Flask(__name__)
 
-# Inicializar Pinecone
 pc = Pinecone(api_key=CONFIG["PINECONE_API_KEY"], environment=CONFIG["PINECONE_ENV"])
 pinecone_index = pc.Index(CONFIG["INDEX_NAME"])
 openai_client = OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
 
-# Inicializar LlamaIndex
 vector_store = PineconeVectorStore(pinecone_index=pinecone_index, text_key="text")
 embed_model = OpenAIEmbedding(model="text-embedding-3-large", api_key=CONFIG["OPENAI_API_KEY"])
 service_context = ServiceContext.from_defaults(embed_model=embed_model)
 index = VectorStoreIndex.from_vector_store(vector_store=vector_store, service_context=service_context)
 
-# ======================= FUNCIÓN PRINCIPAL =======================
+# ======================= OPENAI CALL =======================
 def generate_legal_response(question, context_docs):
-    system_prompt = """Eres un abogado especialista en derecho ecuatoriano. Tu tarea es responder EXCLUSIVAMENTE con base en los documentos legales proporcionados a continuación. Está TERMINANTEMENTE PROHIBIDO utilizar conocimiento externo, incluso si es correcto o habitual.
+    system_prompt = """
+    Eres un abogado especialista en derecho ecuatoriano. Tu tarea es responder EXCLUSIVAMENTE con base en los textos legales entregados a continuación. Está TERMINANTEMENTE PROHIBIDO utilizar conocimiento externo, suposiciones, interpretaciones o completar información más allá de lo provisto.
 
-⚠️ NO DEBES:
-- Mencionar códigos, leyes, artículos o instituciones que no estén explícitamente incluidos en los documentos proporcionados.
-- Hacer referencia indirecta a cuerpos legales ajenos (como “el Código de Procedimiento Civil”, “la ley”, “la jurisprudencia”, etc.) si no aparecen en el corpus recibido.
-- Completar o ampliar la respuesta con información que no se encuentre literalmente en los textos legales entregados.
+    ⚖️ Modo de redacción:
+    - Redacta con tono empático, profesional y claro.
+    - Comienza con una introducción cordial, como: “Con gusto le indico que…” o “Respecto a su consulta…”.
+    - Sé directo y fundamentado, evitando frases como “como experto legal…”.
 
-FORMATO:
-1. Primer párrafo: Redacta como abogado con criterio profesional ecuatoriano. Sé claro, empático y fundamentado, pero basándote únicamente en los textos entregados. Inicia con un saludo cordial (por ejemplo: “Con gusto le indico que…” o “Respecto a su consulta…”), y responda directamente a la pregunta, sin frases como “como abogado especialista…”.
-2. Parte legal:
-- Lista de artículos citados (número y código)
-- Citas textuales reales de los documentos
-- Finaliza con: "Me baso en [artículos citados]"
+    📚 Estructura requerida:
+    1. Redacta una respuesta explicativa clara, pero cada afirmación o dato debe mencionar expresamente de qué artículo y código o ley proviene.
+    2. Incluye al final una lista de los artículos citados: número y nombre del código o ley.
+    3. Incluye citas textuales legales, incluso si están truncadas por el contexto.
+    4. Finaliza siempre con la frase: “Me baso en [artículos citados]”.
 
-⚠️ Si no encuentras normativa aplicable en los textos, responde exactamente:  
-"No encontré normativa aplicable. No me baso en ningún artículo."
-"""
+    ⚠️ Reglas estrictas:
+    - NO cites artículos, códigos o leyes que no estén literal y explícitamente incluidos en el contexto proporcionado.
+    - NO utilices jurisprudencia, doctrina, interpretación propia ni sentido común.
+    - NO completes ideas ni “corrijas” el texto legal aunque te parezca incompleto.
+    - Si no hay normativa aplicable: responde exactamente “No encontré normativa aplicable. No me baso en ningún artículo.”
+    """
+
+
+
     context_text = "\nDOCUMENTOS LEGALES:\n" + "\n".join(
-        f"{doc['codigo']} Art.{doc['articulo']}: {doc['texto']}" for doc in context_docs
+        f"{doc['codigo']} Art.{doc['articulo']}: {doc['texto'][:MAX_TEXT_CHARS]}"
+        for doc in context_docs[:MAX_DOCS_TO_OPENAI]
     )
 
     response = openai_client.chat.completions.create(
@@ -83,12 +91,13 @@ FORMATO:
 
     return response.choices[0].message.content, response.usage.total_tokens
 
-# ======================= FLUJO FLASK =======================
+# ======================= MAIN ENDPOINT =======================
 @app.route("/query", methods=["POST"])
 def handle_query():
     try:
         data = request.get_json()
         question = data.get("question", "").strip()
+
         if not question:
             return jsonify({"error": "Se requiere 'question'"}), 400
 
@@ -102,31 +111,23 @@ def handle_query():
         query_engine = index.as_query_engine(similarity_top_k=TOP_K_RESULTS)
         pinecone_response = query_engine.query(question)
 
-        # Ordenar resultados por score descendente
-        ordenados = sorted(
-            pinecone_response.source_nodes,
-            key=lambda node: getattr(node, 'score', 0.0),
-            reverse=True
-        )
-
-        total_docs = len(ordenados)
-        alta_limite = int(total_docs * 0.3)
-        media_limite = int(total_docs * 0.6)
-
         context_docs = []
         biografia_juridica = {"alta": [], "media": [], "baja": []}
 
-        for i, node in enumerate(ordenados):
+        total_docs = len(pinecone_response.source_nodes)
+        alta_limite = int(total_docs * 0.3)
+        media_limite = int(total_docs * 0.6)
+
+        for i, node in enumerate(pinecone_response.source_nodes):
             score = getattr(node, 'score', 0.0)
             metadata = getattr(node.node, 'metadata', {})
             codigo = metadata.get('code', '')
             articulo = metadata.get('article', '')
-            texto_completo = getattr(node.node, 'text', '') or metadata.get("text", '')
-            texto = texto_completo.strip()
-
-            print(f"🧠 Relevancia {score:.2f} → {codigo} Art.{articulo}")
+            texto = getattr(node.node, 'text', '') or metadata.get("text", '')
+            texto = texto.strip()
 
             doc_data = {"codigo": codigo, "articulo": articulo, "texto": texto}
+            context_docs.append(doc_data)
 
             if i < alta_limite:
                 biografia_juridica["alta"].append(doc_data)
@@ -134,8 +135,6 @@ def handle_query():
                 biografia_juridica["media"].append(doc_data)
             else:
                 biografia_juridica["baja"].append(doc_data)
-
-            context_docs.append(doc_data)
 
         if not context_docs:
             return jsonify({"respuesta": "No encontré normativa aplicable. No me baso en ningún artículo."})
@@ -145,7 +144,7 @@ def handle_query():
         return jsonify({
             "respuesta": respuesta,
             "biografia_juridica": biografia_juridica,
-            "tokens_usados": { "total_tokens": tokens_usados }
+            "tokens_usados": {"total_tokens": tokens_usados}
         })
 
     except Exception as e:
