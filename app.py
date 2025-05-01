@@ -286,5 +286,45 @@ def handle_query():
     except Exception as e:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
+
+# ======================= GENERAR CONTRATO ENDPOINT =======================
+@app.route("/generar-contrato-en-partes", methods=["POST"])
+def generar_contrato_en_partes():
+    try:
+        data = request.get_json()
+        pregunta = data.get("pregunta", "").strip()
+        partes = int(data.get("partes", 4))  # por defecto 4 partes
+
+        if not pregunta:
+            return jsonify({"error": "La pregunta es obligatoria"}), 400
+
+        respuestas = []
+        total_tokens = 0
+
+        for i in range(partes):
+            sub_prompt = f"{pregunta}\n\nParte {i+1}. Continúa desde donde se quedó."
+
+            r = openai_client.chat.completions.create(
+                model=CONFIG["OPENAI_MODEL"],
+                messages=[
+                    {"role": "system", "content": "Eres un abogado ecuatoriano experto en redactar documentos legales como contratos y reglamentos extensos."},
+                    {"role": "user", "content": sub_prompt}
+                ],
+                temperature=CONFIG["TEMPERATURE"],
+                max_tokens=CONFIG["MAX_TOKENS"]
+            )
+
+            respuestas.append(r.choices[0].message.content.strip())
+            total_tokens += r.usage.total_tokens
+
+        return jsonify({
+            "respuesta": "\n\n".join(respuestas),
+            "biografia_juridica": { "alta": [], "media": [], "baja": [] },
+            "tokens_usados": { "total_tokens": total_tokens }
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
