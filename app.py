@@ -286,6 +286,104 @@ def handle_query():
     except Exception as e:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
+# ======================= CALCULOS LEGALES =======================
+@app.route("/calculo-legal", methods=["POST"])
+def calculo_legal():
+    try:
+        data = request.get_json()
+        pregunta = data.get("pregunta", "").strip()
+
+        if not pregunta:
+            return jsonify({"error": "La pregunta es obligatoria"}), 400
+
+        query_engine = index.as_query_engine(similarity_top_k=TOP_K_RESULTS)
+        resultado_pinecone = query_engine.query(pregunta)
+
+        context_docs = []
+        biografia_juridica = {"alta": [], "media": [], "baja": []}
+        total_docs = len(resultado_pinecone.source_nodes)
+        alta_limite = int(total_docs * 0.3)
+        media_limite = int(total_docs * 0.6)
+
+        for i, nodo in enumerate(resultado_pinecone.source_nodes):
+            meta = getattr(nodo.node, 'metadata', {})
+            codigo = meta.get("code", "")
+            articulo = meta.get("article", "")
+            texto = getattr(nodo.node, 'text', '') or meta.get("text", '')
+            texto = texto.strip()
+
+            doc = {"codigo": codigo, "articulo": articulo, "texto": texto}
+            context_docs.append(doc)
+
+            if i < alta_limite:
+                biografia_juridica["alta"].append(doc)
+            elif i < media_limite:
+                biografia_juridica["media"].append(doc)
+            else:
+                biografia_juridica["baja"].append(doc)
+
+        if not context_docs:
+            return jsonify({"respuesta": "No encontré normativa aplicable. No me baso en ningún artículo."})
+
+        system_prompt = """
+Eres un abogado ecuatoriano experto en cálculos legales. Aunque no has sido explícitamente entrenado para este cálculo, harás lo mejor posible para explicar detalladamente cómo se realiza, sin usar cifras numéricas bajo ninguna circunstancia.
+
+⚖️ Modo de redacción:
+- Usa un tono profesional, claro y didáctico.
+- Explica el procedimiento de forma simbólica, utilizando únicamente nombres de variables o conceptos legales (por ejemplo: 'SBU', 'remuneración mensual', 'años de servicio').
+- Detalla las fórmulas, los pasos y los artículos legales aplicables, pero evita por completo cualquier número.
+- Presenta una tabla resumen simbólica (sin valores numéricos).
+- Enumera al final los artículos legales en los que se fundamenta el cálculo.
+
+⚠️ Reglas estrictas:
+- Nunca utilices valores numéricos, incluso si el usuario los proporciona o si están en el contexto legal.
+- Sustituye todos los valores por símbolos o descripciones (por ejemplo: “Remuneración Básica Unificada”, “Bonificación mensual”).
+- No resuelvas las operaciones, solo muéstralas simbólicamente (ej.: Bonificación = SBU / 12).
+- Basa todas tus explicaciones en el contenido legal provisto.
+- ❗ No confundas los conceptos legales: si la ley menciona una variable específica (como 'Remuneración Básica Unificada'), **debes usarla tal como aparece**, sin reemplazarla por otros valores como 'remuneración mensual', 'sueldo' o similares, salvo que el contexto legal lo indique expresamente.
+
+✅ Ejemplo de redacción esperada:
+1. Identificar la variable base del cálculo, que en este caso es la Remuneración Básica Unificada (SBU), conforme al Art. 113 del Código de Trabajo.
+2. Aplicar la fórmula: Bonificación = SBU / 12.
+3. Finalmente, determinar la bonificación acumulada anual multiplicando la bonificación mensual por 12.
+
+🚫 Ejemplo prohibido:
+- “SBU = $400” → ❌ Nunca utilizar valores específicos.
+- “Bonificación = Remuneración mensual / 12” cuando la norma dice SBU → ❌ Incorrecto.
+
+Tu única tarea es explicar el procedimiento legal y matemático de forma simbólica, sin resolver ninguna operación ni asignar valores.
+"""
+
+
+
+        context_text = "\nDOCUMENTOS LEGALES:\n" + "\n".join(
+            f"{doc['codigo']} Art.{doc['articulo']}: {doc['texto'][:MAX_TEXT_CHARS]}"
+            for doc in context_docs[:MAX_DOCS_TO_OPENAI]
+        )
+
+        response = openai_client.chat.completions.create(
+            model=CONFIG["OPENAI_MODEL"],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"{pregunta}\n\n{context_text}"}
+            ],
+            temperature=CONFIG["TEMPERATURE"],
+            max_tokens=CONFIG["MAX_TOKENS"]
+        )
+
+        respuesta_text = response.choices[0].message.content.strip()
+        tokens_usados = response.usage.total_tokens
+
+        return jsonify({
+            "respuesta": respuesta_text,
+            "biografia_juridica": biografia_juridica,
+            "tokens_usados": {"total_tokens": tokens_usados}
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+
+
 
 # ======================= GENERAR CONTRATO ENDPOINT =======================
 @app.route("/generar-contrato-en-partes", methods=["POST"])
