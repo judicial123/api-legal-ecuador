@@ -237,8 +237,8 @@ def handle_query():
         if not question:
             return jsonify({"error": "Se requiere 'question'"}), 400
 
-        if any(kw in question.lower() for kw in MATH_KEYWORDS):
-            return jsonify({"respuesta": "Lamento no realizar cálculos. Contacte al administrador."})
+        # ==== if any(kw in question.lower() for kw in MATH_KEYWORDS):
+        # ====    return jsonify({"respuesta": "Lamento no realizar cálculos. Contacte al administrador."})
 
         match = re.search(r"art[ií]culo\s+(\d+)\s+del\s+c[oó]digo\s+([\w\s]+)", question.lower())
         articulo_buscado = match.group(1) if match else None
