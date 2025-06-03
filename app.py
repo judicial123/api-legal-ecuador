@@ -43,7 +43,7 @@ pinecone_index = pc.Index(CONFIG["INDEX_NAME"])
 
 vector_store = PineconeVectorStore(
     pinecone_index=pinecone_index,
-    text_key=None
+    text_key="respuesta_abogado"
 )
 
 embed_model = OpenAIEmbedding(
@@ -100,7 +100,7 @@ def obtener_respuesta_practica(question):
 
     practical_vector_store = PineconeVectorStore(
         pinecone_index=practical_index,
-        text_key=None
+        text_key="respuesta_abogado"
     )
 
     practical_index_instance = VectorStoreIndex.from_vector_store(
