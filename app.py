@@ -42,8 +42,7 @@ pc = Pinecone(api_key=CONFIG["PINECONE_API_KEY"], environment=CONFIG["PINECONE_E
 pinecone_index = pc.Index(CONFIG["INDEX_NAME"])
 
 vector_store = PineconeVectorStore(
-    pinecone_index=pinecone_index,
-    text_key="respuesta_abogado"
+    pinecone_index=pinecone_index
 )
 
 embed_model = OpenAIEmbedding(
@@ -99,8 +98,7 @@ def obtener_respuesta_practica(question):
     practical_index = pc.Index(practical_index_name)
 
     practical_vector_store = PineconeVectorStore(
-        pinecone_index=practical_index,
-        text_key="respuesta_abogado"
+        pinecone_index=practical_index
     )
 
     practical_index_instance = VectorStoreIndex.from_vector_store(
