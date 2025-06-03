@@ -146,7 +146,9 @@ def handle_query():
 
         if any(kw in question.lower() for kw in MATH_KEYWORDS):
             return jsonify({
-                "respuesta": "Lamento no realizar cálculos. Contacte al administrador."
+                "respuesta": "Lamento no realizar cálculos. Contacte al administrador.",
+                "biografia_juridica": [],
+                "tokens_usados": {"total_tokens": 0}
             })
 
         match = re.search(r"art[ií]culo\s+(\d+)\s+del\s+c[oó]digo\s+([\w\s]+)", question.lower())
@@ -181,29 +183,66 @@ def handle_query():
                 })
 
         if not context_docs:
+            respuesta_practica = obtener_respuesta_practica(question)
+            texto_final = "No encontré normativa aplicable. No me baso en ningún artículo."
+            if respuesta_practica:
+                texto_final += f"\n\n🧑‍⚖️ Consejo práctico:\n{respuesta_practica}"
+
             return jsonify({
-                "respuesta": "No encontré normativa aplicable. No me baso en ningún artículo.",
-                "articulos_referenciados": [],
-                "respuesta_practica_reformulada": obtener_respuesta_practica(question)
+                "respuesta": texto_final,
+                "biografia_juridica": [],
+                "tokens_usados": {"total_tokens": 0}
             })
 
-        respuesta = generate_legal_response(question, context_docs)
+        # Crear contexto legal
+        context_text = "\n".join(
+            f"{doc['codigo']} Art.{doc['articulo']}: {doc['texto'][:600]}"
+            for doc in context_docs
+        )
 
-        articulos_texto = context_docs[:MAX_ARTICULOS_CON_TEXTO]
-        textos_adicionales = "\n\n📚 Otros artículos relacionados:\n"
-        for doc in articulos_texto:
-            textos_adicionales += f"{doc['codigo']} Art.{doc['articulo']}:\n{doc['texto']}\n\n"
+        # Llamada a OpenAI para generar respuesta legal
+        chat_response = openai_client.chat.completions.create(
+            model=CONFIG["OPENAI_MODEL"],
+            messages=[
+                {"role": "system", "content": """Eres un abogado especialista en derecho ecuatoriano. Tu trabajo es responder únicamente con base en los documentos legales proporcionados. No debes inventar información, ni usar conocimientos externos.
 
-        respuesta += textos_adicionales
+Responde de forma profesional y estructurada:
 
-        todos_articulos = list({
-            f"{doc['codigo']} Art.{doc['articulo']}" for doc in context_docs
-        })
+1. Explicación legal clara y directa (basada exclusivamente en los documentos).
+2. Lista de artículos aplicables (número y código).
+3. Citas textuales relevantes del texto legal.
+4. Cierra con: "Me baso en [artículos citados]".
+
+⚠️ Si no encuentras la respuesta en los documentos, responde: "No encontré normativa aplicable. No me baso en ningún artículo."
+"""}, 
+                {"role": "user", "content": f"{question}\n\nDOCUMENTOS LEGALES:\n{context_text}"}
+            ],
+            temperature=CONFIG["TEMPERATURE"],
+            max_tokens=CONFIG["MAX_TOKENS"]
+        )
+
+        respuesta_legal = chat_response.choices[0].message.content.strip()
+        tokens_usados = chat_response.usage.total_tokens
+
+        respuesta_practica = obtener_respuesta_practica(question)
+
+        respuesta_final = respuesta_legal
+        if respuesta_practica:
+            respuesta_final += f"\n\n🧑‍⚖️ Consejo práctico:\n{respuesta_practica}"
+
+        biografia_juridica = [
+            {
+                "codigo": doc["codigo"],
+                "articulo": doc["articulo"],
+                "texto": doc["texto"]
+            }
+            for doc in context_docs[:MAX_ARTICULOS_CON_TEXTO]
+        ]
 
         return jsonify({
-            "respuesta": respuesta,
-            "articulos_referenciados": todos_articulos,
-            "respuesta_practica_reformulada": obtener_respuesta_practica(question)
+            "respuesta": respuesta_final,
+            "biografia_juridica": biografia_juridica,
+            "tokens_usados": {"total_tokens": tokens_usados}
         })
 
     except Exception as e:
@@ -211,6 +250,7 @@ def handle_query():
             "error": f"Error: {str(e)}",
             "traceback": traceback.format_exc()
         }), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
