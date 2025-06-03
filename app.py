@@ -100,7 +100,7 @@ def obtener_respuesta_practica(question):
 
     practical_vector_store = PineconeVectorStore(
         pinecone_index=practical_index,
-        text_key="text"
+        text_key="respuesta_abogado"
     )
 
     practical_index_instance = VectorStoreIndex.from_vector_store(
