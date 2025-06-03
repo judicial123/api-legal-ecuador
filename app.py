@@ -62,16 +62,26 @@ openai_client = OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
 # ============= RESPUESTA LEGAL =============
 
 def generate_legal_response(question, context_docs):
-    system_prompt = """Eres un abogado especialista en derecho ecuatoriano. Tu trabajo es responder únicamente con base en los documentos legales proporcionados. No debes inventar información, ni usar conocimientos externos.
+    system_prompt = """
+Eres un abogado especialista en derecho ecuatoriano. Tu tarea es responder EXCLUSIVAMENTE con base en los textos legales entregados a continuación. Está TERMINANTEMENTE PROHIBIDO utilizar conocimiento externo, suposiciones, interpretaciones o completar información más allá de lo provisto.
 
-Responde de forma profesional y estructurada:
+🧠 Objetivo general:
+Redacta una respuesta útil, clara y jurídica que pueda ser comprendida tanto por ciudadanos sin formación legal como por abogados.
 
-1. Explicación legal clara y directa (basada exclusivamente en los documentos).
-2. Lista de artículos aplicables (número y código).
-3. Citas textuales relevantes del texto legal.
-4. Cierra con: "Me baso en [artículos citados]".
+🫱 Empatía inicial:
+Si la pregunta revela angustia, preocupación o un problema delicado (como cárcel, salud, familia, etc.), comienza con una frase empática y humana, como: “Entendemos lo difícil que puede ser esta situación…” o “Lamentamos lo ocurrido y con gusto le orientamos…”.
 
-⚠️ Si no encuentras la respuesta en los documentos, responde: "No encontré normativa aplicable. No me baso en ningún artículo."
+📘 Estructura obligatoria:
+1. Da una respuesta clara y directa a la pregunta, explicando el contenido legal con palabras sencillas.
+2. Cada afirmación debe mencionar de qué artículo y qué código o ley proviene, si aplica.
+3. Incluye citas textuales relevantes del texto legal, incluso si están truncadas.
+4. Finaliza siempre con la frase: “Me baso en [artículos citados]”.
+
+⚠️ Reglas estrictas:
+- NO cites artículos, códigos o leyes que no estén literalmente presentes en el contexto legal proporcionado.
+- NO utilices jurisprudencia, doctrina, interpretación propia ni conocimiento externo.
+- NO completes ideas que no estén expresamente contenidas en el texto legal.
+- Si no hay normativa aplicable, responde exactamente: “No encontré normativa aplicable. No me baso en ningún artículo.”
 """
 
     context_text = "\nDOCUMENTOS LEGALES:\n" + "\n".join(
@@ -82,14 +92,15 @@ Responde de forma profesional y estructurada:
     response = openai_client.chat.completions.create(
         model=CONFIG["OPENAI_MODEL"],
         messages=[
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt.strip()},
             {"role": "user", "content": f"{question}\n\n{context_text}"}
         ],
         temperature=CONFIG["TEMPERATURE"],
         max_tokens=CONFIG["MAX_TOKENS"]
     )
 
-    return response.choices[0].message.content
+    return response.choices[0].message.content.strip()
+
 
 # ============= RESPUESTA PRÁCTICA =============
 
@@ -115,12 +126,19 @@ def obtener_respuesta_practica(question):
     texto_practico = resultado.response.strip()
 
     # Reformular con tono humano
-    prompt = f"""
-Reformula esta respuesta práctica legal para que suene humana, empática, cercana y útil para alguien sin conocimientos jurídicos. Usa segunda persona. No repitas textos literales ni artículos.
+    prompt = (
+    "Reformula esta respuesta práctica legal para que suene humana, empática, cercana y útil para alguien sin conocimientos jurídicos. Usa segunda persona.\n\n"
+    "✅ Conserva obligatoriamente:\n"
+    "- Enlaces web útiles como http://consultas.funcionjudicial.gob.ec\n"
+    "- Instrucciones o pasos que sirvan a cualquier persona\n"
+    "- Nombres de instituciones públicas\n"
+    "- Referencias legales si las hay\n\n"
+    "❌ Elimina o generaliza:\n"
+    "- Datos personales (nombres, apellidos, cédulas)\n"
+    "- Información individualizada como montos de pensión, sueldos, edades, fechas específicas\n\n"
+    f"Texto original:\n{texto_practico}"
+)
 
-Texto original:
-{texto_practico}
-"""
     reformulado = openai_client.chat.completions.create(
         model=CONFIG["OPENAI_MODEL"],
         messages=[
@@ -135,11 +153,14 @@ Texto original:
 
 # ============= ENDPOINT PRINCIPAL =============
 
-@app.route("/query", methods=["POST"])
+@app.route("/query", methods=["GET", "POST"])
 def handle_query():
     try:
-        data = request.get_json()
-        question = data.get("question", "").strip()
+        if request.method == "GET":
+            question = request.args.get("question", "").strip()
+        else:
+            data = request.get_json()
+            question = data.get("question", "").strip()
 
         if not question:
             return jsonify({"error": "Se requiere 'question'"}), 400
