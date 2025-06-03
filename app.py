@@ -10,7 +10,7 @@ import traceback
 import re
 import unicodedata
 
-# ============= CONFIGURACIÓN MODIFICABLE =============
+# ============= CONFIGURACIÓN =============
 CONFIG = {
     "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
     "PINECONE_API_KEY": os.getenv("PINECONE_API_KEY"),
@@ -26,7 +26,9 @@ TOP_K_RESULTS = 25
 SIMILARITY_THRESHOLD = 0.5
 MAX_ARTICULOS_CON_TEXTO = 5
 
-# ============= IMPLEMENTACIÓN =============
+app = Flask(__name__)
+
+# ============= UTILIDADES =============
 
 def normalizar(texto):
     return ''.join(
@@ -34,12 +36,10 @@ def normalizar(texto):
         if unicodedata.category(c) != 'Mn'
     ).lower()
 
-app = Flask(__name__)
+# ============= LLAMA INDEX =============
 
-# Inicialización de clientes
 pc = Pinecone(api_key=CONFIG["PINECONE_API_KEY"], environment=CONFIG["PINECONE_ENV"])
 pinecone_index = pc.Index(CONFIG["INDEX_NAME"])
-openai_client = OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
 
 vector_store = PineconeVectorStore(
     pinecone_index=pinecone_index,
@@ -57,6 +57,10 @@ index = VectorStoreIndex.from_vector_store(
     vector_store=vector_store,
     service_context=service_context
 )
+
+openai_client = OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
+
+# ============= RESPUESTA LEGAL =============
 
 def generate_legal_response(question, context_docs):
     system_prompt = """Eres un abogado especialista en derecho ecuatoriano. Tu trabajo es responder únicamente con base en los documentos legales proporcionados. No debes inventar información, ni usar conocimientos externos.
@@ -87,6 +91,51 @@ Responde de forma profesional y estructurada:
     )
 
     return response.choices[0].message.content
+
+# ============= RESPUESTA PRÁCTICA =============
+
+def obtener_respuesta_practica(question):
+    practical_index_name = "indice-respuestas-abogados"
+    practical_index = pc.Index(practical_index_name)
+
+    practical_vector_store = PineconeVectorStore(
+        pinecone_index=practical_index,
+        text_key="text"
+    )
+
+    practical_index_instance = VectorStoreIndex.from_vector_store(
+        vector_store=practical_vector_store,
+        service_context=service_context
+    )
+
+    engine = practical_index_instance.as_query_engine(similarity_top_k=1)
+    resultado = engine.query(question)
+
+    if not resultado.source_nodes:
+        return None
+
+    texto_practico = resultado.response.strip()
+
+    # Reformular con tono humano
+    prompt = f"""
+Reformula esta respuesta práctica legal para que suene humana, empática, cercana y útil para alguien sin conocimientos jurídicos. Usa segunda persona. No repitas textos literales ni artículos.
+
+Texto original:
+{text_practico}
+"""
+    reformulado = openai_client.chat.completions.create(
+        model=CONFIG["OPENAI_MODEL"],
+        messages=[
+            {"role": "system", "content": "Eres un asistente legal empático que habla en tono claro y humano."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.4,
+        max_tokens=800
+    )
+
+    return reformulado.choices[0].message.content.strip()
+
+# ============= ENDPOINT PRINCIPAL =============
 
 @app.route("/query", methods=["POST"])
 def handle_query():
@@ -136,7 +185,8 @@ def handle_query():
         if not context_docs:
             return jsonify({
                 "respuesta": "No encontré normativa aplicable. No me baso en ningún artículo.",
-                "articulos_referenciados": []
+                "articulos_referenciados": [],
+                "respuesta_practica_reformulada": obtener_respuesta_practica(question)
             })
 
         respuesta = generate_legal_response(question, context_docs)
@@ -154,7 +204,8 @@ def handle_query():
 
         return jsonify({
             "respuesta": respuesta,
-            "articulos_referenciados": todos_articulos
+            "articulos_referenciados": todos_articulos,
+            "respuesta_practica_reformulada": obtener_respuesta_practica(question)
         })
 
     except Exception as e:
