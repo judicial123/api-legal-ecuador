@@ -43,7 +43,7 @@ pinecone_index = pc.Index(CONFIG["INDEX_NAME"])
 
 vector_store = PineconeVectorStore(
     pinecone_index=pinecone_index,
-    text_key="respuesta_abogado"
+    text_key=None
 )
 
 embed_model = OpenAIEmbedding(
@@ -100,7 +100,7 @@ def obtener_respuesta_practica(question):
 
     practical_vector_store = PineconeVectorStore(
         pinecone_index=practical_index,
-        text_key="respuesta_abogado"
+        text_key=None
     )
 
     practical_index_instance = VectorStoreIndex.from_vector_store(
@@ -121,7 +121,7 @@ def obtener_respuesta_practica(question):
 Reformula esta respuesta práctica legal para que suene humana, empática, cercana y útil para alguien sin conocimientos jurídicos. Usa segunda persona. No repitas textos literales ni artículos.
 
 Texto original:
-{text_practico}
+{texto_practico}
 """
     reformulado = openai_client.chat.completions.create(
         model=CONFIG["OPENAI_MODEL"],
@@ -166,7 +166,7 @@ def handle_query():
             metadata = getattr(node.node, 'metadata', {})
             codigo = metadata.get('code', '')
             articulo = metadata.get('article', '')
-            texto = getattr(node.node, 'text', '') or metadata.get("text", '')
+            texto = metadata.get("respuesta_abogado", "")
 
             if articulo_buscado:
                 if articulo == articulo_buscado and normalizar(codigo) == codigo_buscado:
