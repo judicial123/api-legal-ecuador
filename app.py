@@ -43,7 +43,7 @@ pinecone_index = pc.Index(CONFIG["INDEX_NAME"])
 
 vector_store = PineconeVectorStore(
     pinecone_index=pinecone_index,
-    text_key="text"
+    text_key="respuesta_abogado"
 )
 
 embed_model = OpenAIEmbedding(
