@@ -158,43 +158,14 @@ def obtener_respuesta_practica(question):
     return reformulado.choices[0].message.content.strip()
 
 # ============= ENDPOINT PRINCIPAL =============
-
 @app.route("/query", methods=["GET", "POST"])
 def handle_query():
     try:
-        # Soporte para GET (solo para pruebas)
-        if request.method == "GET":
-            question = request.args.get("question", "").strip()
-        else:  # POST
-            data = request.get_json()
-            question = data.get("question", "").strip() if data else ""
-
+        question = request.args.get("question", "").strip() if request.method == "GET" else request.get_json().get("question", "").strip()
         if not question:
             return jsonify({"error": "Se requiere 'question'"}), 400
 
-        # Buscar experiencia previa similar (nuevo índice)
-        index_respuestas_abogados = pc.Index("indice-respuestas-abogados")
-        embedding = embed_model._get_query_embedding(question)
-
-        contexto_practico = None
-        try:
-            similares = index_respuestas_abogados.query(
-                vector=embedding,
-                top_k=1,
-                include_metadata=True
-            )
-            if similares and similares.get("matches"):
-                match = similares["matches"][0]
-                if match["score"] >= 0.75:
-                    meta = match["metadata"]
-                    idea = meta.get("respuesta_abogado", "")
-                    descripcion = meta.get("descripcion", "")
-                    contexto_practico = f'En casos como "{descripcion.lower()}" se suele actuar de la siguiente forma: {idea[:300]}...'
-        except Exception as e:
-            print(f"⚠️ Error en índice respuestas-abogados: {e}")
-            contexto_practico = None
-
-        # Consulta normal en índice legal
+        # ========== CONTEXTO LEGAL ==========
         query_engine = index.as_query_engine(similarity_top_k=TOP_K_RESULTS)
         pinecone_response = query_engine.query(question)
 
@@ -206,7 +177,6 @@ def handle_query():
         media_limite = int(total_docs * 0.6)
 
         for i, node in enumerate(pinecone_response.source_nodes):
-            score = getattr(node, 'score', 0.0)
             metadata = getattr(node.node, 'metadata', {})
             codigo = metadata.get('code', '')
             articulo = metadata.get('article', '')
@@ -226,11 +196,34 @@ def handle_query():
         if not context_docs:
             return jsonify({"respuesta": "No encontré normativa aplicable. No me baso en ningún artículo."})
 
-        # Llamar a generate_legal_response con el nuevo contexto adicional
-        respuesta, tokens_usados = generate_legal_response(question, context_docs, contexto_practico)
+        # ========== RESPUESTAS ==========
+        respuesta_legal, tokens_usados = generate_legal_response(question, context_docs)
+
+        index_respuestas_abogados = pc.Index("indice-respuestas-abogados")
+        embedding = embed_model._get_query_embedding(question)
+        similares = index_respuestas_abogados.query(vector=embedding, top_k=1, include_metadata=True)
+
+        respuesta_practica_reformulada = None
+        urls_extraidas = []
+
+        if similares.get("matches"):
+            raw_text = similares["matches"][0]["metadata"].get("respuesta_abogado", "")
+            urls_extraidas = re.findall(r"http[s]?://\S+", raw_text)
+            respuesta_practica_reformulada = obtener_respuesta_practica(question)
+            for url in urls_extraidas:
+                if url not in respuesta_practica_reformulada:
+                    respuesta_practica_reformulada += f"\n🔗 Más información: {url}"
+
+        # ========== UNIFICAR RESPUESTA ==========
+        bloques = []
+
+        if respuesta_practica_reformulada:
+            bloques.append("📌 Recomendación práctica:\n" + respuesta_practica_reformulada.strip())
+
+        bloques.append("⚖️ Fundamento legal:\n" + respuesta_legal.strip())
 
         return jsonify({
-            "respuesta": respuesta,
+            "respuesta": "\n\n---\n\n".join(bloques),
             "biografia_juridica": biografia_juridica,
             "tokens_usados": {"total_tokens": tokens_usados}
         })
@@ -238,6 +231,44 @@ def handle_query():
     except Exception as e:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
+
+# ============= ENDPOINT PRINCIPAL =============
+@app.route("/test-contexto-practico", methods=["POST"])
+def test_contexto_practico():
+    try:
+        data = request.get_json()
+        question = data.get("question", "").strip() if data else ""
+        if not question:
+            return jsonify({"error": "Se requiere 'question'"}), 400
+
+        index_respuestas_abogados = pc.Index("indice-respuestas-abogados")
+        embedding = embed_model._get_query_embedding(question)
+
+        similares = index_respuestas_abogados.query(
+            vector=embedding,
+            top_k=1,
+            include_metadata=True
+        )
+
+        if not similares.get("matches"):
+            return jsonify({"respuesta": "❌ No se encontró coincidencia."})
+
+        match = similares["matches"][0]
+        score = match["score"]
+        idea = match["metadata"].get("respuesta_abogado", "")
+        descripcion = match["metadata"].get("descripcion", "")
+
+        contexto_practico = f'En casos como "{descripcion.lower()}" se suele actuar de la siguiente forma: {idea[:300]}...'
+
+        return jsonify({
+            "score": score,
+            "descripcion": descripcion,
+            "respuesta_abogado": idea,
+            "contexto_practico": contexto_practico
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 if __name__ == "__main__":
