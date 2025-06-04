@@ -110,7 +110,7 @@ Si la pregunta revela angustia, preocupación o un problema delicado (como cárc
 
 # ============= RESPUESTA PRÁCTICA =============
 
-def obtener_respuesta_practica(question):
+def obtener_respuesta_practica(question, score=None):
     practical_index_name = "indice-respuestas-abogados"
     practical_index = pc.Index(practical_index_name)
 
@@ -131,20 +131,34 @@ def obtener_respuesta_practica(question):
 
     texto_practico = resultado.response.strip()
 
-    # Reformular con tono humano
-    prompt = (
-    "Reformula esta respuesta práctica legal para que suene humana, empática, cercana y útil para alguien sin conocimientos jurídicos. Usa segunda persona.\n\n"
-    "✅ Conserva obligatoriamente:\n"
-    "- Enlaces web útiles como http://consultas.funcionjudicial.gob.ec\n"
-    "- Instrucciones o pasos que sirvan a cualquier persona\n"
-    "- Nombres de instituciones públicas\n"
-    "- Referencias legales si las hay\n\n"
-    "❌ Elimina o generaliza:\n"
-    "- Datos personales (nombres, apellidos, cédulas)\n"
-    "- Información individualizada como montos de pensión, sueldos, edades, fechas específicas\n\n"
-    f"Texto original:\n{texto_practico}"
-)
+    # Elegir introducción según el score
+    if score is not None and score < 0.75:
+        introduccion = (
+            "❗ La respuesta no responde directamente a la pregunta del usuario.\n"
+            "- Introduce con una frase como:\n"
+            "  \"Es difícil indicarte si [reformula aquí la intención del usuario], en este caso es importante que un abogado experto te asesore. Sin embargo, puedo decirte que...\"\n"
+            "- Reformula después el contenido original como referencia general.\n"
+            "- No afirmes nada que no esté expresamente en el texto original.\n"
+        )
+    else:
+        introduccion = (
+            "✅ La respuesta es clara y útil para la pregunta del usuario:\n"
+            "- Reformúlala sin alterar el mensaje, con un tono claro, amable y profesional.\n"
+        )
 
+    # Prompt final
+    prompt = (
+        "Reformula esta respuesta práctica legal para que suene humana, empática, cercana y útil para alguien sin conocimientos jurídicos. Usa segunda persona. Evalúa si responde o no directamente a la siguiente pregunta:\n\n"
+        f"🧑‍⚖️ Pregunta del usuario: \"{question}\"\n\n"
+        f"{introduccion}\n"
+        "🔒 Reglas adicionales:\n"
+        "- Conserva enlaces web útiles como http://consultas.funcionjudicial.gob.ec si están presentes en el texto original.\n"
+        "- NO agregues enlaces si no están.\n"
+        "- Elimina nombres propios, montos específicos, fechas y datos sensibles.\n\n"
+        f"Texto original:\n{texto_practico}"
+    )
+
+    # Llamada a OpenAI
     reformulado = openai_client.chat.completions.create(
         model=CONFIG["OPENAI_MODEL"],
         messages=[
@@ -156,6 +170,7 @@ def obtener_respuesta_practica(question):
     )
 
     return reformulado.choices[0].message.content.strip()
+
 
 # ============= ENDPOINT PRINCIPAL =============
 @app.route("/query", methods=["GET", "POST"])
@@ -204,15 +219,11 @@ def handle_query():
         similares = index_respuestas_abogados.query(vector=embedding, top_k=1, include_metadata=True)
 
         respuesta_practica_reformulada = None
-        urls_extraidas = []
 
         if similares.get("matches"):
-            raw_text = similares["matches"][0]["metadata"].get("respuesta_abogado", "")
-            urls_extraidas = re.findall(r"http[s]?://\S+", raw_text)
-            respuesta_practica_reformulada = obtener_respuesta_practica(question)
-            for url in urls_extraidas:
-                if url not in respuesta_practica_reformulada:
-                    respuesta_practica_reformulada += f"\n🔗 Más información: {url}"
+            match = similares["matches"][0]
+            score = match.get("score", 0)
+            respuesta_practica_reformulada = obtener_respuesta_practica(question, score=score)
 
         # ========== UNIFICAR RESPUESTA ==========
         bloques = []
