@@ -61,7 +61,7 @@ openai_client = OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
 
 # ============= RESPUESTA LEGAL =============
 
-def generate_legal_response(question, context_docs):
+def generate_legal_response(question, context_docs, contexto_practico=None):
     system_prompt = """
 Eres un abogado especialista en derecho ecuatoriano. Tu tarea es responder EXCLUSIVAMENTE con base en los textos legales entregados a continuación. Está TERMINANTEMENTE PROHIBIDO utilizar conocimiento externo, suposiciones, interpretaciones o completar información más allá de lo provisto.
 
@@ -89,6 +89,9 @@ Si la pregunta revela angustia, preocupación o un problema delicado (como cárc
         for doc in context_docs
     )
 
+    if contexto_practico:
+        context_text += f"\n\n🧾 Contexto práctico adicional: {contexto_practico}"
+
     response = openai_client.chat.completions.create(
         model=CONFIG["OPENAI_MODEL"],
         messages=[
@@ -99,7 +102,10 @@ Si la pregunta revela angustia, preocupación o un problema delicado (como cárc
         max_tokens=CONFIG["MAX_TOKENS"]
     )
 
-    return response.choices[0].message.content.strip()
+    respuesta = response.choices[0].message.content.strip()
+    tokens_usados = response.usage.total_tokens if response.usage else 0
+    return respuesta, tokens_usados
+
 
 
 # ============= RESPUESTA PRÁCTICA =============
