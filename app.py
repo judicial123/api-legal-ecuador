@@ -246,6 +246,87 @@ def handle_query():
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
+# ======================= GENERAR CONTRATO COMPLETO =======================
+@app.route("/generar-contrato-completo", methods=["POST"])
+def generar_contrato_completo():
+    try:
+        data = request.get_json()
+        pregunta = data.get("pregunta", "").strip()
+
+        if not pregunta:
+            return jsonify({"error": "La pregunta es obligatoria"}), 400
+
+        # Consulta artículos desde Pinecone
+        query_engine = index.as_query_engine(similarity_top_k=10)
+        resultado = query_engine.query(pregunta)
+
+        contexto_legal = []
+        biografia_juridica = {"alta": [], "media": [], "baja": []}
+
+        total_docs = len(resultado.source_nodes)
+        alta_limite = int(total_docs * 0.3)
+        media_limite = int(total_docs * 0.6)
+
+        for i, nodo in enumerate(resultado.source_nodes):
+            meta = getattr(nodo.node, 'metadata', {})
+            codigo = meta.get("code", "")
+            articulo = meta.get("article", "")
+            texto = getattr(nodo.node, 'text', '') or meta.get("text", '')
+            texto = texto.strip()
+
+            if codigo and articulo:
+                contexto_legal.append(f"{codigo} Art. {articulo}: {texto[:500]}")
+                doc = {"codigo": codigo, "articulo": articulo, "texto": texto}
+
+                if i < alta_limite:
+                    biografia_juridica["alta"].append(doc)
+                elif i < media_limite:
+                    biografia_juridica["media"].append(doc)
+                else:
+                    biografia_juridica["baja"].append(doc)
+
+        prompt = f"""
+Eres un abogado ecuatoriano experto en redacción de documentos legales. Vas a redactar un texto profesional, completo y jurídicamente válido, en respuesta a la solicitud del usuario.
+
+✍️ Instrucciones estrictas:
+- Redacta directamente el documento legal solicitado, sin explicaciones ni introducciones.
+- Usa lenguaje legal claro y preciso, adecuado al sistema jurídico del Ecuador.
+- Si el documento requiere estructura (contrato, demanda, reglamento, etc.), incluye numeración adecuada: cláusulas, artículos, incisos.
+- Si el documento es breve (como una solicitud o escrito procesal), redacta en formato carta legal.
+- Utiliza campos genéricos para datos personales: [NOMBRE], [FECHA], [CANTIDAD], [CIUDAD], etc.
+- No agregues artículos legales inventados: usa solo los del contexto.
+
+📄 Solicitud del usuario:
+{pregunta}
+
+📚 Contexto legal (solo puedes usar esto):
+{chr(10).join(contexto_legal)}
+
+🧾 Al final del documento, incluye una sección con el encabezado “Fundamento legal” y menciona los artículos usados.
+""".strip()
+
+        response = openai_client.chat.completions.create(
+            model=CONFIG["OPENAI_MODEL"],
+            messages=[
+                {"role": "system", "content": "Eres un abogado ecuatoriano experto en redacción legal."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=CONFIG["TEMPERATURE"],
+            max_tokens=CONFIG["MAX_TOKENS"] - 500
+        )
+
+        texto = response.choices[0].message.content.strip()
+        tokens = response.usage.total_tokens
+
+        return jsonify({
+            "respuesta": texto,
+            "tokens_usados": { "total_tokens": tokens },
+            "biografia_juridica": biografia_juridica
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+
 # ============= ENDPOINT PRINCIPAL =============
 @app.route("/test-contexto-practico", methods=["POST"])
 def test_contexto_practico():
