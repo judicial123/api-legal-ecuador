@@ -223,7 +223,10 @@ def handle_query():
         if similares.get("matches"):
             match = similares["matches"][0]
             score = match.get("score", 0)
-            respuesta_practica_reformulada = obtener_respuesta_practica(question, score=score)
+            if score >= 0.6:
+                respuesta_practica_reformulada = obtener_respuesta_practica(question, score=score)
+            else:
+                respuesta_practica_reformulada = None
 
         # ========== UNIFICAR RESPUESTA ==========
         bloques = []
