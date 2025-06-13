@@ -255,6 +255,8 @@ def handle_query():
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
+import tiktoken
+
 # ======================= GENERAR CONTRATO COMPLETO =======================
 @app.route("/generar-contrato-completo", methods=["POST"])
 def generar_contrato_completo():
@@ -274,7 +276,7 @@ def generar_contrato_completo():
             contrato_base = resultado_contrato.source_nodes[0].node.text.strip()
 
         if contrato_base:
-            # Si se encontró un contrato modelo
+            # Crear el prompt
             prompt = f"""
 Eres un abogado ecuatoriano experto en redacción de documentos legales. A continuación tienes un modelo jurídico que debes adaptar para responder a la solicitud del usuario. Mantén su estructura y estilo, pero personaliza el contenido según la petición.
 
@@ -289,14 +291,30 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. A conti
 - Usa lenguaje jurídico claro.
 - Usa campos genéricos como [NOMBRE], [FECHA], etc.
 """.strip()
+
+            # Función para contar tokens
+            def contar_tokens(texto):
+                enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
+                return len(enc.encode(texto))
+
+            tokens_prompt = contar_tokens(prompt)
+
+            # Elegir modelo según cantidad de tokens
+            if tokens_prompt <= 3000:
+                modelo = "gpt-3.5-turbo"
+                max_tokens_salida = 1000
+            else:
+                modelo = "gpt-4o"
+                max_tokens_salida = 8000
+
             response = openai_client.chat.completions.create(
-                model=CONFIG["OPENAI_MODEL"],
+                model=modelo,
                 messages=[
                     {"role": "system", "content": "Eres un abogado ecuatoriano experto en redacción legal."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=CONFIG["TEMPERATURE"],
-                max_tokens=CONFIG["MAX_TOKENS"] - 500
+                max_tokens=max_tokens_salida
             )
 
             texto = response.choices[0].message.content.strip()
@@ -378,6 +396,7 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. Vas a r
 
     except Exception as e:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+
 
 
 # ============= ENDPOINT PRINCIPAL =============
