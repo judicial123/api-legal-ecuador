@@ -50,6 +50,15 @@ embed_model = OpenAIEmbedding(
     api_key=CONFIG["OPENAI_API_KEY"]
 )
 
+# Cargar el índice de Pinecone donde están los contratos
+contratos_index = VectorStoreIndex.from_vector_store(
+    PineconeVectorStore(
+        pinecone_index=pc.Index("indice-contratos-legales"),
+        text_key="text"
+    ),
+    service_context=ServiceContext.from_defaults(embed_model=embed_model)
+)
+
 service_context = ServiceContext.from_defaults(embed_model=embed_model)
 
 index = VectorStoreIndex.from_vector_store(
@@ -256,7 +265,50 @@ def generar_contrato_completo():
         if not pregunta:
             return jsonify({"error": "La pregunta es obligatoria"}), 400
 
-        # Consulta artículos desde Pinecone
+        # Paso 1: Buscar contrato modelo en índice de contratos
+        contrato_query_engine = contratos_index.as_query_engine(similarity_top_k=1)
+        resultado_contrato = contrato_query_engine.query(pregunta)
+
+        contrato_base = ""
+        if resultado_contrato.source_nodes:
+            contrato_base = resultado_contrato.source_nodes[0].node.text.strip()
+
+        if contrato_base:
+            # Si se encontró un contrato modelo
+            prompt = f"""
+Eres un abogado ecuatoriano experto en redacción de documentos legales. A continuación tienes un modelo jurídico que debes adaptar para responder a la solicitud del usuario. Mantén su estructura y estilo, pero personaliza el contenido según la petición.
+
+📄 Solicitud del usuario:
+{pregunta}
+
+📑 Modelo de referencia:
+{contrato_base}
+
+✍️ Instrucciones:
+- No incluyas explicaciones, solo el documento.
+- Usa lenguaje jurídico claro.
+- Usa campos genéricos como [NOMBRE], [FECHA], etc.
+""".strip()
+            response = openai_client.chat.completions.create(
+                model=CONFIG["OPENAI_MODEL"],
+                messages=[
+                    {"role": "system", "content": "Eres un abogado ecuatoriano experto en redacción legal."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=CONFIG["TEMPERATURE"],
+                max_tokens=CONFIG["MAX_TOKENS"] - 500
+            )
+
+            texto = response.choices[0].message.content.strip()
+            tokens = response.usage.total_tokens
+
+            return jsonify({
+                "respuesta": texto,
+                "tokens_usados": { "total_tokens": tokens },
+                "biografia_juridica": None
+            })
+
+        # Paso 2: Si no hay contrato modelo, usar contexto legal tradicional
         query_engine = index.as_query_engine(similarity_top_k=10)
         resultado = query_engine.query(pregunta)
 
@@ -326,6 +378,7 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. Vas a r
 
     except Exception as e:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+
 
 # ============= ENDPOINT PRINCIPAL =============
 @app.route("/test-contexto-practico", methods=["POST"])
