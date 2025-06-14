@@ -257,6 +257,29 @@ def handle_query():
 
 import tiktoken
 
+from flask import send_from_directory
+from docx import Document
+import uuid
+import os
+
+# Endpoint de descarga (añádelo solo una vez en tu app)
+@app.route("/descargar/<filename>")
+def descargar_archivo(filename):
+    return send_from_directory("archivos_temp", filename, as_attachment=True)
+
+# Función auxiliar para guardar y generar link
+def guardar_docx_y_retornar_link(texto, host_url):
+    filename = f"{uuid.uuid4()}.docx"
+    filepath = os.path.join("archivos_temp", filename)
+    os.makedirs("archivos_temp", exist_ok=True)
+
+    doc = Document()
+    for linea in texto.split('\n'):
+        doc.add_paragraph(linea)
+    doc.save(filepath)
+
+    return f"{host_url}descargar/{filename}"
+
 # ======================= GENERAR CONTRATO COMPLETO =======================
 @app.route("/generar-contrato-completo", methods=["POST"])
 def generar_contrato_completo():
@@ -267,7 +290,6 @@ def generar_contrato_completo():
         if not pregunta:
             return jsonify({"error": "La pregunta es obligatoria"}), 400
 
-        # Paso 1: Buscar contrato modelo en índice de contratos
         contrato_query_engine = contratos_index.as_query_engine(similarity_top_k=1)
         resultado_contrato = contrato_query_engine.query(pregunta)
 
@@ -276,7 +298,6 @@ def generar_contrato_completo():
             contrato_base = resultado_contrato.source_nodes[0].node.text.strip()
 
         if contrato_base:
-            # Crear el prompt
             prompt = f"""
 Eres un abogado ecuatoriano experto en redacción de documentos legales. A continuación tienes un modelo jurídico que debes adaptar para responder a la solicitud del usuario. Mantén su estructura y estilo, pero personaliza el contenido según la petición.
 
@@ -292,14 +313,12 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. A conti
 - Usa campos genéricos como [NOMBRE], [FECHA], etc.
 """.strip()
 
-            # Función para contar tokens
             def contar_tokens(texto):
                 enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
                 return len(enc.encode(texto))
 
             tokens_prompt = contar_tokens(prompt)
 
-            # Elegir modelo según cantidad de tokens
             if tokens_prompt <= 3000:
                 modelo = "gpt-3.5-turbo"
                 max_tokens_salida = 1000
@@ -320,13 +339,20 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. A conti
             texto = response.choices[0].message.content.strip()
             tokens = response.usage.total_tokens
 
+            if tokens > 8000:
+                url = guardar_docx_y_retornar_link(texto, request.host_url)
+                return jsonify({
+                    "respuesta": f"✅ El documento ha sido generado correctamente. <a href='{url}' target='_blank'>Haz clic aquí para descargarlo en Word (.docx)</a>.",
+                    "tokens_usados": { "total_tokens": tokens },
+                    "biografia_juridica": None
+                })
+
             return jsonify({
                 "respuesta": texto,
                 "tokens_usados": { "total_tokens": tokens },
                 "biografia_juridica": None
             })
 
-        # Paso 2: Si no hay contrato modelo, usar contexto legal tradicional
         query_engine = index.as_query_engine(similarity_top_k=10)
         resultado = query_engine.query(pregunta)
 
@@ -387,6 +413,14 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. Vas a r
 
         texto = response.choices[0].message.content.strip()
         tokens = response.usage.total_tokens
+
+        if tokens > 8000:
+            url = guardar_docx_y_retornar_link(texto, request.host_url)
+            return jsonify({
+                "respuesta": f"✅ El documento ha sido generado correctamente. <a href='{url}' target='_blank'>Haz clic aquí para descargarlo en Word (.docx)</a>.",
+                "tokens_usados": { "total_tokens": tokens },
+                "biografia_juridica": biografia_juridica
+            })
 
         return jsonify({
             "respuesta": texto,
