@@ -10,6 +10,10 @@ import traceback
 import re
 import unicodedata
 
+import requests
+from bs4 import BeautifulSoup
+from llama_index import Document  # Ya estás importando VectorStoreIndex, te falta Document
+
 # ============= CONFIGURACIÓN =============
 CONFIG = {
     "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
@@ -18,8 +22,11 @@ CONFIG = {
     "PINECONE_ENV": os.getenv("PINECONE_ENV"),
     "OPENAI_MODEL": "gpt-3.5-turbo",
     "TEMPERATURE": 0.3,
-    "MAX_TOKENS": 2000
+    "MAX_TOKENS": 2000,
+    "GOOGLE_SEARCH_API_KEY": os.getenv("GOOGLE_SEARCH_API_KEY"),
+    "GOOGLE_CX": os.getenv("GOOGLE_CX")
 }
+
 
 MATH_KEYWORDS = ['calcular', 'cálculo', 'fórmula', 'sumar', 'restar', 'multiplicar', 'dividir']
 TOP_K_RESULTS = 25
@@ -431,6 +438,139 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. Vas a r
     except Exception as e:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
+# ============= WEBSEARCH PRINCIPAL =============
+GOOGLE_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
+SEARCH_ENGINE_ID = os.getenv("GOOGLE_CX")
+
+
+from llama_index.schema import Document  # ✅ Importación correcta para tu versión
+
+import os
+import requests
+from bs4 import BeautifulSoup
+from flask import request, jsonify
+from llama_index import VectorStoreIndex, Document
+import traceback
+
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")  # Asegúrate de definirlo en tu entorno
+
+@app.route("/websearch", methods=["POST"])
+def websearch():
+    try:
+        pregunta = request.get_json().get("pregunta", "").strip()
+        if not pregunta:
+            return jsonify({"error": "Se requiere 'pregunta'"}), 400
+
+        # ===== Buscar en índice de respuestas prácticas =====
+        index_respuestas_abogados = pc.Index("indice-respuestas-abogados")
+        embedding = embed_model._get_query_embedding(pregunta)
+
+        similares = index_respuestas_abogados.query(
+            vector=embedding,
+            top_k=1,
+            include_metadata=True
+        )
+
+        mostrar_respuesta_practica = False
+        mostrar_google = True
+        respuesta_practica_html = ""
+
+        score = 0
+        if similares.get("matches"):
+            match = similares["matches"][0]
+            score = match.get("score", 0)
+
+            if score >= 0.70:
+                mostrar_respuesta_practica = True
+                mostrar_google = False
+            elif 0.60 <= score < 0.70:
+                mostrar_respuesta_practica = True
+                mostrar_google = True
+            else:
+                mostrar_google = True
+
+            if mostrar_respuesta_practica:
+                respuesta_practica = obtener_respuesta_practica(pregunta, score=score)
+                if respuesta_practica:
+                    respuesta_practica_html = f"<h3>📌 Recomendación práctica</h3><div class='chat-respuesta'>{respuesta_practica}</div>"
+                    if mostrar_google:
+                        respuesta_practica_html += "<hr>"
+
+        respuesta_google_html = ""
+        tokens = 0
+
+        if mostrar_google:
+            # ===== Buscar en Google =====
+            search_url = "https://www.googleapis.com/customsearch/v1"
+            search_params = {
+                "key": GOOGLE_API_KEY,
+                "cx": SEARCH_ENGINE_ID,
+                "q": pregunta,
+                "siteSearch": "gob.ec",
+                "siteSearchFilter": "i"
+            }
+            search_resp = requests.get(search_url, params=search_params)
+            search_resp.raise_for_status()
+            resultados = search_resp.json().get("items", [])[:5]
+
+            if not resultados:
+                respuesta_google_html = "<h3>🌐 Respuesta basada en Google</h3><div class='chat-respuesta'>❌ No se encontraron páginas relevantes.</div>"
+            else:
+                contexto = "\n".join(
+                    [f"Título: {item['title']}\nLink: {item['link']}" for item in resultados]
+                )
+
+                prompt = f"""
+Eres un abogado experto. Un usuario te hace la siguiente pregunta:
+
+\"{pregunta}\"
+
+Google te ha mostrado los siguientes resultados relacionados:
+
+{contexto}
+
+Tu tarea es:
+
+1. Responder al usuario de manera clara y directa, en un párrafo.
+2. Indicar que debe realizar el proceso en fuentes oficiales.
+3. Recomendar los enlaces más útiles (basado en los títulos) ordenados por relevancia para que el usuario continúe su trámite.
+
+Responde con lenguaje humano, sin tecnicismos innecesarios y sin inventar datos que no estén respaldados por los títulos mostrados.
+""".strip()
+
+                response = openai_client.chat.completions.create(
+                    model=CONFIG["OPENAI_MODEL"],
+                    messages=[
+                        {"role": "system", "content": "Eres un abogado experto que ayuda con trámites legales en Ecuador."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=CONFIG["TEMPERATURE"],
+                    max_tokens=800
+                )
+
+                respuesta_ia_cruda = response.choices[0].message.content.strip()
+                tokens = response.usage.total_tokens
+
+                enlaces_html = []
+                for i, item in enumerate(resultados, 1):
+                    titulo = item.get("title", f"Fuente {i}").strip()
+                    url = item.get("link", "#")
+                    enlaces_html.append(f"<li>🔗 <strong>{titulo}</strong><br><a href='{url}' target='_blank'>{url}</a></li>")
+
+                if enlaces_html:
+                    respuesta_ia_cruda += "<br><br><ul class='fuentes-web'>" + "\n".join(enlaces_html) + "</ul>"
+
+                respuesta_google_html = f"<h3>🌐 Respuesta basada en Google</h3><div class='chat-respuesta'>{respuesta_ia_cruda}</div>"
+
+        # ========== RESPUESTA FINAL ==========
+        return jsonify({
+            "respuesta": respuesta_practica_html + respuesta_google_html,
+            "tokens_usados": {"total_tokens": tokens},
+            "biografia_juridica": ""
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 # ============= ENDPOINT PRINCIPAL =============
