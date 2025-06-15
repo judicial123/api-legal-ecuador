@@ -439,6 +439,15 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. Vas a r
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 # ============= WEBSEARCH PRINCIPAL =============
+
+@app.route("/envtest", methods=["GET"])
+def env_test():
+    return jsonify({
+        "GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),
+        "SEARCH_ENGINE_ID": os.getenv("SEARCH_ENGINE_ID")
+    })
+
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
 SEARCH_ENGINE_ID = os.getenv("GOOGLE_CX")
 
