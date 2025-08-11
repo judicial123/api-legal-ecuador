@@ -1,18 +1,22 @@
 import os
+import re
+import unicodedata
+import traceback
+import uuid
+
 from openai import OpenAI
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from llama_index import VectorStoreIndex
 from llama_index.vector_stores import PineconeVectorStore
 from pinecone import Pinecone
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index import ServiceContext
-import traceback
-import re
-import unicodedata
+from llama_index.schema import Document  # ✅ Document (una sola import)
+from docx import Document as DocxDocument
+import tiktoken
 
 import requests
 from bs4 import BeautifulSoup
-from llama_index import Document  # Ya estás importando VectorStoreIndex, te falta Document
 
 # ============= CONFIGURACIÓN =============
 CONFIG = {
@@ -24,9 +28,8 @@ CONFIG = {
     "TEMPERATURE": 0.3,
     "MAX_TOKENS": 2000,
     "GOOGLE_SEARCH_API_KEY": os.getenv("GOOGLE_SEARCH_API_KEY"),
-    "GOOGLE_CX": os.getenv("GOOGLE_CX")
+    "GOOGLE_CX": os.getenv("GOOGLE_CX"),
 }
-
 
 MATH_KEYWORDS = ['calcular', 'cálculo', 'fórmula', 'sumar', 'restar', 'multiplicar', 'dividir']
 TOP_K_RESULTS = 25
@@ -36,28 +39,49 @@ MAX_ARTICULOS_CON_TEXTO = 5
 app = Flask(__name__)
 
 # ============= UTILIDADES =============
-
 def normalizar(texto):
     return ''.join(
         c for c in unicodedata.normalize('NFD', texto)
         if unicodedata.category(c) != 'Mn'
     ).lower()
 
-# ============= LLAMA INDEX =============
+# ✅ Conteo de tokens robusto (evita KeyError con modelos nuevos)
+def contar_tokens(texto, model_name="gpt-5-mini"):
+    try:
+        enc = tiktoken.encoding_for_model(model_name)
+    except Exception:
+        # Fallbacks seguros si el modelo no está mapeado
+        try:
+            enc = tiktoken.get_encoding("o200k_base")
+        except Exception:
+            enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(texto or ""))
 
+# ✅ Helper para compatibilidad gpt-5* (usa max_completion_tokens)
+def create_completion(client, model, messages, temperature, max_tokens):
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if str(model).startswith("gpt-5"):
+        kwargs["max_completion_tokens"] = max_tokens
+    else:
+        kwargs["max_tokens"] = max_tokens
+    return client.chat.completions.create(**kwargs)
+
+# ============= LLAMA INDEX / PINECONE =============
 pc = Pinecone(api_key=CONFIG["PINECONE_API_KEY"], environment=CONFIG["PINECONE_ENV"])
 pinecone_index = pc.Index(CONFIG["INDEX_NAME"])
 
-vector_store = PineconeVectorStore(
-    pinecone_index=pinecone_index
-)
+vector_store = PineconeVectorStore(pinecone_index=pinecone_index)
 
 embed_model = OpenAIEmbedding(
     model="text-embedding-3-large",
     api_key=CONFIG["OPENAI_API_KEY"]
 )
 
-# Cargar el índice de Pinecone donde están los contratos
+# Índice de contratos
 contratos_index = VectorStoreIndex.from_vector_store(
     PineconeVectorStore(
         pinecone_index=pc.Index("indice-contratos-legales"),
@@ -76,7 +100,6 @@ index = VectorStoreIndex.from_vector_store(
 openai_client = OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
 
 # ============= RESPUESTA LEGAL =============
-
 def generate_legal_response(question, context_docs, contexto_practico=None):
     system_prompt = """
 Eres un abogado especialista en derecho ecuatoriano. Tu tarea es responder EXCLUSIVAMENTE con base en los textos legales entregados a continuación. Está TERMINANTEMENTE PROHIBIDO utilizar conocimiento externo, suposiciones, interpretaciones o completar información más allá de lo provisto.
@@ -85,20 +108,19 @@ Eres un abogado especialista en derecho ecuatoriano. Tu tarea es responder EXCLU
 Redacta una respuesta útil, clara y jurídica que pueda ser comprendida tanto por ciudadanos sin formación legal como por abogados.
 
 🫱 Empatía inicial:
-Si la pregunta revela angustia, preocupación o un problema delicado (como cárcel, salud, familia, etc.), comienza con una frase empática y humana, como: “Entendemos lo difícil que puede ser esta situación…” o “Lamentamos lo ocurrido y con gusto le orientamos…”.
+Si la pregunta revela angustia, preocupación o un problema delicado (como cárcel, salud, familia, etc.), comienza con una frase empática y humana.
 
 📘 Estructura obligatoria:
-1. Da una respuesta clara y directa a la pregunta, explicando el contenido legal con palabras sencillas.
+1. Respuesta clara y directa.
 2. Cada afirmación debe mencionar de qué artículo y qué código o ley proviene, si aplica.
 3. Incluye citas textuales relevantes del texto legal, incluso si están truncadas.
-4. Finaliza siempre con la frase: “Me baso en [artículos citados]”.
+4. Finaliza: “Me baso en [artículos citados]”.
 
 ⚠️ Reglas estrictas:
-- NO cites artículos, códigos o leyes que no estén literalmente presentes en el contexto legal proporcionado.
-- NO utilices jurisprudencia, doctrina, interpretación propia ni conocimiento externo.
-- NO completes ideas que no estén expresamente contenidas en el texto legal.
-- Si no hay normativa aplicable, responde exactamente: “No encontré normativa aplicable. No me baso en ningún artículo.”
-"""
+- NO cites artículos que no estén en el contexto.
+- NO uses jurisprudencia/doctrina externa.
+- Si no hay normativa aplicable, responde: “No encontré normativa aplicable. No me baso en ningún artículo.”
+""".strip()
 
     context_text = "\nDOCUMENTOS LEGALES:\n" + "\n".join(
         f"{doc['codigo']} Art.{doc['articulo']}: {doc['texto'][:600]}"
@@ -108,31 +130,27 @@ Si la pregunta revela angustia, preocupación o un problema delicado (como cárc
     if contexto_practico:
         context_text += f"\n\n🧾 Contexto práctico adicional: {contexto_practico}"
 
-    response = openai_client.chat.completions.create(
-        model=CONFIG["OPENAI_MODEL"],
-        messages=[
-            {"role": "system", "content": system_prompt.strip()},
+    response = create_completion(
+        openai_client,
+        CONFIG["OPENAI_MODEL"],
+        [
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"{question}\n\n{context_text}"}
         ],
-        temperature=CONFIG["TEMPERATURE"],
-        max_tokens=CONFIG["MAX_TOKENS"]
+        CONFIG["TEMPERATURE"],
+        CONFIG["MAX_TOKENS"]
     )
 
     respuesta = response.choices[0].message.content.strip()
     tokens_usados = response.usage.total_tokens if response.usage else 0
     return respuesta, tokens_usados
 
-
-
 # ============= RESPUESTA PRÁCTICA =============
-
 def obtener_respuesta_practica(question, score=None):
     practical_index_name = "indice-respuestas-abogados"
     practical_index = pc.Index(practical_index_name)
 
-    practical_vector_store = PineconeVectorStore(
-        pinecone_index=practical_index
-    )
+    practical_vector_store = PineconeVectorStore(pinecone_index=practical_index)
 
     practical_index_instance = VectorStoreIndex.from_vector_store(
         vector_store=practical_vector_store,
@@ -147,37 +165,34 @@ def obtener_respuesta_practica(question, score=None):
 
     texto_practico = resultado.response.strip()
 
-    # Elegir introducción según el score
     if score is not None and score < 0.75:
         introduccion = (
             "❗ La respuesta no responde directamente a la pregunta del usuario.\n"
-            "- Introduce con una frase como:\n"
-            "  \"Es difícil indicarte si [reformula aquí la intención del usuario], en este caso es importante que un abogado experto te asesore. Sin embargo, puedo decirte que...\"\n"
-            "- Reformula después el contenido original como referencia general.\n"
-            "- No afirmes nada que no esté expresamente en el texto original.\n"
+            "- Introduce con una frase empática y de cautela.\n"
+            "- Reformula el contenido original sin afirmar nada que no esté en el texto.\n"
         )
     else:
         introduccion = (
             "✅ La respuesta es clara y útil para la pregunta del usuario:\n"
-            "- Reformúlala sin alterar el mensaje, con un tono claro, amable y profesional.\n"
+            "- Reformúlala en tono claro, amable y profesional.\n"
         )
 
-    # Prompt final
     prompt = (
-        "Reformula esta respuesta práctica legal para que suene humana, empática, cercana y útil para alguien sin conocimientos jurídicos. Usa segunda persona. Evalúa si responde o no directamente a la siguiente pregunta:\n\n"
+        "Reformula esta respuesta práctica legal para que suene humana, empática y útil. Usa segunda persona. "
+        "Evalúa si responde directamente a la pregunta.\n\n"
         f"🧑‍⚖️ Pregunta del usuario: \"{question}\"\n\n"
         f"{introduccion}\n"
-        "🔒 Reglas adicionales:\n"
-        "- Conserva enlaces web útiles como http://consultas.funcionjudicial.gob.ec si están presentes en el texto original.\n"
+        "🔒 Reglas:\n"
+        "- Conserva enlaces útiles si existen.\n"
         "- NO agregues enlaces si no están.\n"
-        "- Elimina nombres propios, montos específicos, fechas y datos sensibles.\n\n"
+        "- Elimina datos sensibles.\n\n"
         f"Texto original:\n{texto_practico}"
     )
 
-    # Llamada a OpenAI
-    reformulado = openai_client.chat.completions.create(
-        model=CONFIG["OPENAI_MODEL"],
-        messages=[
+    reformulado = create_completion(
+        openai_client,
+        CONFIG["OPENAI_MODEL"],
+        [
             {"role": "system", "content": "Eres un asistente legal empático que habla en tono claro y humano."},
             {"role": "user", "content": prompt}
         ],
@@ -186,7 +201,6 @@ def obtener_respuesta_practica(question, score=None):
     )
 
     return reformulado.choices[0].message.content.strip()
-
 
 # ============= ENDPOINT PRINCIPAL =============
 @app.route("/query", methods=["GET", "POST"])
@@ -231,25 +245,20 @@ def handle_query():
         respuesta_legal, tokens_usados = generate_legal_response(question, context_docs)
 
         index_respuestas_abogados = pc.Index("indice-respuestas-abogados")
-        embedding = embed_model._get_query_embedding(question)
+        embedding = embed_model._get_query_embedding(question)  # mantiene tu versión
         similares = index_respuestas_abogados.query(vector=embedding, top_k=1, include_metadata=True)
 
         respuesta_practica_reformulada = None
-
         if similares.get("matches"):
             match = similares["matches"][0]
             score = match.get("score", 0)
             if score >= 0.6:
                 respuesta_practica_reformulada = obtener_respuesta_practica(question, score=score)
-            else:
-                respuesta_practica_reformulada = None
 
         # ========== UNIFICAR RESPUESTA ==========
         bloques = []
-
         if respuesta_practica_reformulada:
             bloques.append("📌 Recomendación práctica:\n" + respuesta_practica_reformulada.strip())
-
         bloques.append("⚖️ Fundamento legal:\n" + respuesta_legal.strip())
 
         return jsonify({
@@ -261,26 +270,17 @@ def handle_query():
     except Exception as e:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
-
-import tiktoken
-
-from flask import send_from_directory
-from docx import Document
-import uuid
-import os
-
-# Endpoint de descarga (añádelo solo una vez en tu app)
+# ======================= DESCARGA =======================
 @app.route("/descargar/<filename>")
 def descargar_archivo(filename):
     return send_from_directory("archivos_temp", filename, as_attachment=True)
 
-# Función auxiliar para guardar y generar link
 def guardar_docx_y_retornar_link(texto, host_url):
     filename = f"{uuid.uuid4()}.docx"
     filepath = os.path.join("archivos_temp", filename)
     os.makedirs("archivos_temp", exist_ok=True)
 
-    doc = Document()
+    doc = DocxDocument()
     for linea in texto.split('\n'):
         doc.add_paragraph(linea)
     doc.save(filepath)
@@ -306,7 +306,7 @@ def generar_contrato_completo():
 
         if contrato_base:
             prompt = f"""
-Eres un abogado ecuatoriano experto en redacción de documentos legales. A continuación tienes un modelo jurídico que debes adaptar para responder a la solicitud del usuario. Mantén su estructura y estilo, pero personaliza el contenido según la petición.
+Eres un abogado ecuatoriano experto en redacción de documentos legales. Adapta el siguiente modelo jurídico a la solicitud del usuario. Mantén estructura y estilo, personaliza el contenido.
 
 📄 Solicitud del usuario:
 {pregunta}
@@ -315,16 +315,12 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. A conti
 {contrato_base}
 
 ✍️ Instrucciones:
-- No incluyas explicaciones, solo el documento.
-- Usa lenguaje jurídico claro.
-- Usa campos genéricos como [NOMBRE], [FECHA], etc.
+- Solo el documento (sin explicaciones).
+- Lenguaje jurídico claro.
+- Usa campos genéricos: [NOMBRE], [FECHA], etc.
 """.strip()
 
-            def contar_tokens(texto):
-                enc = tiktoken.encoding_for_model("gpt-5-mini")
-                return len(enc.encode(texto))
-
-            tokens_prompt = contar_tokens(prompt)
+            tokens_prompt = contar_tokens(prompt, CONFIG["OPENAI_MODEL"])
 
             if tokens_prompt <= 3000:
                 modelo = "gpt-5-mini"
@@ -333,33 +329,35 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. A conti
                 modelo = "gpt-4o"
                 max_tokens_salida = 8000
 
-            response = openai_client.chat.completions.create(
-                model=modelo,
-                messages=[
+            response = create_completion(
+                openai_client,
+                modelo,
+                [
                     {"role": "system", "content": "Eres un abogado ecuatoriano experto en redacción legal."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=CONFIG["TEMPERATURE"],
-                max_tokens=max_tokens_salida
+                CONFIG["TEMPERATURE"],
+                max_tokens_salida
             )
 
             texto = response.choices[0].message.content.strip()
-            tokens = response.usage.total_tokens
+            tokens = response.usage.total_tokens if response.usage else 0
 
             if tokens > 8000:
                 url = guardar_docx_y_retornar_link(texto, request.host_url)
                 return jsonify({
-                    "respuesta": f"✅ El documento ha sido generado correctamente. <a href='{url}' target='_blank'>Haz clic aquí para descargarlo en Word (.docx)</a>.",
-                    "tokens_usados": { "total_tokens": tokens },
+                    "respuesta": f"✅ Documento generado. <a href='{url}' target='_blank'>Descargar Word (.docx)</a>.",
+                    "tokens_usados": {"total_tokens": tokens},
                     "biografia_juridica": None
                 })
 
             return jsonify({
                 "respuesta": texto,
-                "tokens_usados": { "total_tokens": tokens },
+                "tokens_usados": {"total_tokens": tokens},
                 "biografia_juridica": None
             })
 
+        # === Si no hay modelo base, usa contexto legal del índice principal ===
         query_engine = index.as_query_engine(similarity_top_k=10)
         resultado = query_engine.query(pregunta)
 
@@ -389,49 +387,49 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. A conti
                     biografia_juridica["baja"].append(doc)
 
         prompt = f"""
-Eres un abogado ecuatoriano experto en redacción de documentos legales. Vas a redactar un texto profesional, completo y jurídicamente válido, en respuesta a la solicitud del usuario.
+Eres un abogado ecuatoriano experto en redacción de documentos legales. Redacta el documento solicitado.
 
-✍️ Instrucciones estrictas:
-- Redacta directamente el documento legal solicitado, sin explicaciones ni introducciones.
-- Usa lenguaje legal claro y preciso, adecuado al sistema jurídico del Ecuador.
-- Si el documento requiere estructura (contrato, demanda, reglamento, etc.), incluye numeración adecuada: cláusulas, artículos, incisos.
-- Si el documento es breve (como una solicitud o escrito procesal), redacta en formato carta legal.
-- Utiliza campos genéricos para datos personales: [NOMBRE], [FECHA], [CANTIDAD], [CIUDAD], etc.
-- No agregues artículos legales inventados: usa solo los del contexto.
+✍️ Reglas:
+- Entrega el documento directamente (sin explicaciones).
+- Lenguaje legal claro y preciso.
+- Si aplica, estructura con cláusulas/artículos.
+- Usa campos genéricos: [NOMBRE], [FECHA], [CANTIDAD], [CIUDAD].
+- Solo usa artículos del contexto.
 
-📄 Solicitud del usuario:
+📄 Solicitud:
 {pregunta}
 
-📚 Contexto legal (solo puedes usar esto):
+📚 Contexto legal (usa solo esto):
 {chr(10).join(contexto_legal)}
 
-🧾 Al final del documento, incluye una sección con el encabezado “Fundamento legal” y menciona los artículos usados.
+🧾 Al final agrega “Fundamento legal” con los artículos usados.
 """.strip()
 
-        response = openai_client.chat.completions.create(
-            model=CONFIG["OPENAI_MODEL"],
-            messages=[
+        response = create_completion(
+            openai_client,
+            CONFIG["OPENAI_MODEL"],
+            [
                 {"role": "system", "content": "Eres un abogado ecuatoriano experto en redacción legal."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=CONFIG["TEMPERATURE"],
-            max_tokens=CONFIG["MAX_TOKENS"] - 500
+            CONFIG["TEMPERATURE"],
+            CONFIG["MAX_TOKENS"] - 500
         )
 
         texto = response.choices[0].message.content.strip()
-        tokens = response.usage.total_tokens
+        tokens = response.usage.total_tokens if response.usage else 0
 
         if tokens > 8000:
             url = guardar_docx_y_retornar_link(texto, request.host_url)
             return jsonify({
-                "respuesta": f"✅ El documento ha sido generado correctamente. <a href='{url}' target='_blank'>Haz clic aquí para descargarlo en Word (.docx)</a>.",
-                "tokens_usados": { "total_tokens": tokens },
+                "respuesta": f"✅ Documento generado. <a href='{url}' target='_blank'>Descargar Word (.docx)</a>.",
+                "tokens_usados": {"total_tokens": tokens},
                 "biografia_juridica": biografia_juridica
             })
 
         return jsonify({
             "respuesta": texto,
-            "tokens_usados": { "total_tokens": tokens },
+            "tokens_usados": {"total_tokens": tokens},
             "biografia_juridica": biografia_juridica
         })
 
@@ -439,7 +437,6 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. Vas a r
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 # ============= WEBSEARCH PRINCIPAL =============
-
 @app.route("/envtest", methods=["GET"])
 def env_test():
     return jsonify({
@@ -447,19 +444,8 @@ def env_test():
         "SEARCH_ENGINE_ID": os.getenv("SEARCH_ENGINE_ID")
     })
 
-
 GOOGLE_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
 SEARCH_ENGINE_ID = os.getenv("GOOGLE_CX")
-
-
-from llama_index.schema import Document  # ✅ Importación correcta para tu versión
-
-import os
-import requests
-from bs4 import BeautifulSoup
-from flask import request, jsonify
-from llama_index import VectorStoreIndex, Document
-import traceback
 
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")  # Asegúrate de definirlo en tu entorno
 
@@ -473,11 +459,8 @@ def websearch():
         # ===== Buscar en índice de respuestas prácticas =====
         index_respuestas_abogados = pc.Index("indice-respuestas-abogados")
         embedding = embed_model._get_query_embedding(pregunta)
-
         similares = index_respuestas_abogados.query(
-            vector=embedding,
-            top_k=1,
-            include_metadata=True
+            vector=embedding, top_k=1, include_metadata=True
         )
 
         mostrar_respuesta_practica = False
@@ -501,7 +484,10 @@ def websearch():
             if mostrar_respuesta_practica:
                 respuesta_practica = obtener_respuesta_practica(pregunta, score=score)
                 if respuesta_practica:
-                    respuesta_practica_html = f"<h3>📌 Recomendación práctica</h3><div class='chat-respuesta'>{respuesta_practica}</div>"
+                    respuesta_practica_html = (
+                        "<h3>📌 Recomendación práctica</h3>"
+                        f"<div class='chat-respuesta'>{respuesta_practica}</div>"
+                    )
                     if mostrar_google:
                         respuesta_practica_html += "<hr>"
 
@@ -534,31 +520,31 @@ Eres un abogado experto. Un usuario te hace la siguiente pregunta:
 
 \"{pregunta}\"
 
-Google te ha mostrado los siguientes resultados relacionados:
+Google te ha mostrado los siguientes resultados:
 
 {contexto}
 
-Tu tarea es:
+Tareas:
+1) Responde claro y directo en un párrafo.
+2) Indica que debe realizar el proceso en fuentes oficiales.
+3) Recomienda enlaces más útiles (por títulos) en orden de relevancia.
 
-1. Responder al usuario de manera clara y directa, en un párrafo.
-2. Indicar que debe realizar el proceso en fuentes oficiales.
-3. Recomendar los enlaces más útiles (basado en los títulos) ordenados por relevancia para que el usuario continúe su trámite.
-
-Responde con lenguaje humano, sin tecnicismos innecesarios y sin inventar datos que no estén respaldados por los títulos mostrados.
+No inventes datos que no estén respaldados por los títulos mostrados.
 """.strip()
 
-                response = openai_client.chat.completions.create(
-                    model=CONFIG["OPENAI_MODEL"],
-                    messages=[
+                response = create_completion(
+                    openai_client,
+                    CONFIG["OPENAI_MODEL"],
+                    [
                         {"role": "system", "content": "Eres un abogado experto que ayuda con trámites legales en Ecuador."},
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=CONFIG["TEMPERATURE"],
-                    max_tokens=800
+                    CONFIG["TEMPERATURE"],
+                    800
                 )
 
                 respuesta_ia_cruda = response.choices[0].message.content.strip()
-                tokens = response.usage.total_tokens
+                tokens = response.usage.total_tokens if response.usage else 0
 
                 enlaces_html = []
                 for i, item in enumerate(resultados, 1):
@@ -571,7 +557,6 @@ Responde con lenguaje humano, sin tecnicismos innecesarios y sin inventar datos 
 
                 respuesta_google_html = f"<h3>🌐 Respuesta basada en Google</h3><div class='chat-respuesta'>{respuesta_ia_cruda}</div>"
 
-        # ========== RESPUESTA FINAL ==========
         return jsonify({
             "respuesta": respuesta_practica_html + respuesta_google_html,
             "tokens_usados": {"total_tokens": tokens},
@@ -581,8 +566,7 @@ Responde con lenguaje humano, sin tecnicismos innecesarios y sin inventar datos 
     except Exception as e:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
-
-# ============= ENDPOINT PRINCIPAL =============
+# ============= TEST CONTEXTO PRÁCTICO =============
 @app.route("/test-contexto-practico", methods=["POST"])
 def test_contexto_practico():
     try:
@@ -620,6 +604,6 @@ def test_contexto_practico():
     except Exception as e:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
-
+# ============= RUN =============
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
