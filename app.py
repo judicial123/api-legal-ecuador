@@ -78,7 +78,7 @@ openai_client = OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
 # ============= RESPUESTA LEGAL =============
 
 def generate_legal_response(question, context_docs, contexto_practico=None):
-    # Modelo quemado (no depende de CONFIG)
+    # Modelo quemado
     MODEL = "gpt-5-mini"
 
     system_prompt = """
@@ -114,17 +114,17 @@ Si la pregunta revela angustia, preocupación o un problema delicado (como cárc
         {"role": "user", "content": f"{question}\n\n{context_text}"}
     ]
 
-    # gpt-5-* requiere max_completion_tokens (no max_tokens)
+    # gpt-5-mini: usar max_completion_tokens y NO enviar temperature
     response = openai_client.chat.completions.create(
         model=MODEL,
         messages=messages,
-        temperature=CONFIG["TEMPERATURE"],
         max_completion_tokens=CONFIG["MAX_TOKENS"]
     )
 
     respuesta = response.choices[0].message.content.strip()
     tokens_usados = response.usage.total_tokens if getattr(response, "usage", None) else 0
     return respuesta, tokens_usados
+
 
 
 
