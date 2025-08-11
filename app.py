@@ -20,7 +20,7 @@ CONFIG = {
     "PINECONE_API_KEY": os.getenv("PINECONE_API_KEY"),
     "INDEX_NAME": os.getenv("INDEX_NAME"),
     "PINECONE_ENV": os.getenv("PINECONE_ENV"),
-    "OPENAI_MODEL": "gpt-3.5-turbo",
+    "OPENAI_MODEL": "gpt-5-mini",
     "TEMPERATURE": 0.3,
     "MAX_TOKENS": 2000,
     "GOOGLE_SEARCH_API_KEY": os.getenv("GOOGLE_SEARCH_API_KEY"),
@@ -321,13 +321,13 @@ Eres un abogado ecuatoriano experto en redacción de documentos legales. A conti
 """.strip()
 
             def contar_tokens(texto):
-                enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
+                enc = tiktoken.encoding_for_model("gpt-5-mini")
                 return len(enc.encode(texto))
 
             tokens_prompt = contar_tokens(prompt)
 
             if tokens_prompt <= 3000:
-                modelo = "gpt-3.5-turbo"
+                modelo = "gpt-5-mini"
                 max_tokens_salida = 1000
             else:
                 modelo = "gpt-4o"
