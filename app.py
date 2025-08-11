@@ -78,6 +78,9 @@ openai_client = OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
 # ============= RESPUESTA LEGAL =============
 
 def generate_legal_response(question, context_docs, contexto_practico=None):
+    # Modelo quemado (no depende de CONFIG)
+    MODEL = "gpt-5-mini"
+
     system_prompt = """
 Eres un abogado especialista en derecho ecuatoriano. Tu tarea es responder EXCLUSIVAMENTE con base en los textos legales entregados a continuación. Está TERMINANTEMENTE PROHIBIDO utilizar conocimiento externo, suposiciones, interpretaciones o completar información más allá de lo provisto.
 
@@ -85,42 +88,44 @@ Eres un abogado especialista en derecho ecuatoriano. Tu tarea es responder EXCLU
 Redacta una respuesta útil, clara y jurídica que pueda ser comprendida tanto por ciudadanos sin formación legal como por abogados.
 
 🫱 Empatía inicial:
-Si la pregunta revela angustia, preocupación o un problema delicado (como cárcel, salud, familia, etc.), comienza con una frase empática y humana, como: “Entendemos lo difícil que puede ser esta situación…” o “Lamentamos lo ocurrido y con gusto le orientamos…”.
+Si la pregunta revela angustia, preocupación o un problema delicado (como cárcel, salud, familia, etc.), comienza con una frase empática y humana.
 
 📘 Estructura obligatoria:
-1. Da una respuesta clara y directa a la pregunta, explicando el contenido legal con palabras sencillas.
-2. Cada afirmación debe mencionar de qué artículo y qué código o ley proviene, si aplica.
-3. Incluye citas textuales relevantes del texto legal, incluso si están truncadas.
-4. Finaliza siempre con la frase: “Me baso en [artículos citados]”.
+1. Da una respuesta clara y directa.
+2. Menciona el artículo y la norma de cada afirmación cuando aplique.
+3. Incluye citas textuales relevantes del texto legal, aunque sean truncadas.
+4. Finaliza: “Me baso en [artículos citados]”.
 
 ⚠️ Reglas estrictas:
-- NO cites artículos, códigos o leyes que no estén literalmente presentes en el contexto legal proporcionado.
-- NO utilices jurisprudencia, doctrina, interpretación propia ni conocimiento externo.
-- NO completes ideas que no estén expresamente contenidas en el texto legal.
-- Si no hay normativa aplicable, responde exactamente: “No encontré normativa aplicable. No me baso en ningún artículo.”
-"""
+- NO cites artículos/normas fuera del contexto.
+- NO uses jurisprudencia/doctrina externa.
+- Si no hay normativa aplicable, responde: “No encontré normativa aplicable. No me baso en ningún artículo.”
+""".strip()
 
     context_text = "\nDOCUMENTOS LEGALES:\n" + "\n".join(
         f"{doc['codigo']} Art.{doc['articulo']}: {doc['texto'][:600]}"
         for doc in context_docs
     )
-
     if contexto_practico:
         context_text += f"\n\n🧾 Contexto práctico adicional: {contexto_practico}"
 
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"{question}\n\n{context_text}"}
+    ]
+
+    # gpt-5-* requiere max_completion_tokens (no max_tokens)
     response = openai_client.chat.completions.create(
-        model=CONFIG["OPENAI_MODEL"],
-        messages=[
-            {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": f"{question}\n\n{context_text}"}
-        ],
+        model=MODEL,
+        messages=messages,
         temperature=CONFIG["TEMPERATURE"],
-        max_tokens=CONFIG["MAX_TOKENS"]
+        max_completion_tokens=CONFIG["MAX_TOKENS"]
     )
 
     respuesta = response.choices[0].message.content.strip()
-    tokens_usados = response.usage.total_tokens if response.usage else 0
+    tokens_usados = response.usage.total_tokens if getattr(response, "usage", None) else 0
     return respuesta, tokens_usados
+
 
 
 
