@@ -124,6 +124,101 @@ Si la pregunta revela angustia, preocupación o un problema delicado (como cárc
 
 
 
+# ============= RESPUESTA LEGAL 5 =============
+def generate_legal_response5(question, context_docs, contexto_practico=None):
+    """
+    Firma y retorno idénticos al original:
+    - Params: (question, context_docs, contexto_practico=None)
+    - Return: (respuesta:str, tokens_usados:int)
+
+    Cambios clave:
+    - Compatibilidad GPT-5: usa max_completion_tokens y NO envía temperature.
+    - Backward compatible (GPT-3.5/4): usa max_tokens y temperature.
+    - Sin documentos: fallback con prefijo obligatorio y orientación general.
+    """
+    model = CONFIG.get("OPENAI_MODEL", "gpt-5-mini")
+    is_gpt5 = str(model).startswith("gpt-5")
+    max_out = int(CONFIG.get("MAX_TOKENS", 2000))  # seguimos respetando tu config
+
+    # =============== 1) Sin documentos → Fallback con prefijo obligatorio ===============
+    if not context_docs:
+        fallback_prefix = "no encontré normativa oficial, sin embargo "
+        system_prompt_fb = (
+            "Eres un abogado ecuatoriano. No tienes documentos normativos para citar. "
+            "Puedes usar conocimiento general para orientar, pero NO cites artículos, códigos ni números de ley; "
+            "evita montos y plazos exactos y aclara que es orientación general. "
+            f"Tu respuesta DEBE comenzar EXACTAMENTE con: \"{fallback_prefix}\" (respetando minúsculas) "
+            "y luego ofrecer orientación breve y útil. Sugiere confirmar en fuentes oficiales (Función Judicial, SRI, IESS, MDT) "
+            "y consultar con un abogado cuando aplique."
+        )
+        user_msg_fb = (
+            "Formato:\n"
+            f"- Comienza exacto con: \"{fallback_prefix}\".\n"
+            "- Ofrece 5–8 frases o bullets prácticos, claros y accionables.\n"
+            "- Indica que es orientación general sin base normativa.\n\n"
+            f"Pregunta del usuario:\n{question}"
+        )
+
+        kwargs = dict(model=model, messages=[
+            {"role": "system", "content": system_prompt_fb},
+            {"role": "user", "content": user_msg_fb}
+        ])
+        if is_gpt5:
+            kwargs["max_completion_tokens"] = max_out
+        else:
+            kwargs["temperature"] = CONFIG.get("TEMPERATURE", 0.3)
+            kwargs["max_tokens"] = max_out
+
+        resp = openai_client.chat.completions.create(**kwargs)
+        respuesta = (resp.choices[0].message.content or "").strip()
+        tokens_usados = resp.usage.total_tokens if getattr(resp, "usage", None) else 0
+        return respuesta, tokens_usados
+
+    # =============== 2) Con documentos → Modo estricto (solo lo del contexto) ===============
+    system_prompt = """
+Eres un abogado ecuatoriano. RESPONDE SOLO con base en los “DOCUMENTOS LEGALES” provistos.
+Prohibido conocimiento externo, suposiciones o jurisprudencia que no esté en esos documentos.
+
+Estilo:
+- Claro y directo, lenguaje llano.
+- Solo una frase empática si hay angustia evidente.
+- Prioriza los documentos en el orden entregado.
+
+Estructura obligatoria:
+1) Respuesta directa (2–4 frases) que resuelva la duda con palabras sencillas.
+2) Fundamento con citas: menciona [CÓDIGO Art. N] por cada afirmación.
+3) Citas textuales breves (10–30 palabras) de los artículos, entre comillas.
+4) Cierre EXACTO: “Me baso en [artículos citados]”.
+
+Reglas de rigor:
+- No infieras nada que no esté textual en los documentos.
+- Si una afirmación no puede trazarse a un artículo citado, elimínala.
+- Cuando un artículo se cita varias veces, escribe su referencia una sola vez en el cierre.
+""".strip()
+
+    context_text = "\nDOCUMENTOS LEGALES:\n" + "\n".join(
+        f"{doc['codigo']} Art.{doc['articulo']}: {doc['texto'][:600]}"
+        for doc in context_docs
+    )
+
+    if contexto_practico:
+        context_text += f"\n\n🧾 Contexto práctico adicional: {contexto_practico}"
+
+    kwargs = dict(model=model, messages=[
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"{question}\n\n{context_text}"}
+    ])
+    if is_gpt5:
+        kwargs["max_completion_tokens"] = max_out
+    else:
+        kwargs["temperature"] = CONFIG.get("TEMPERATURE", 0.3)
+        kwargs["max_tokens"] = max_out
+
+    response = openai_client.chat.completions.create(**kwargs)
+    respuesta = (response.choices[0].message.content or "").strip()
+    tokens_usados = response.usage.total_tokens if getattr(response, "usage", None) else 0
+    return respuesta, tokens_usados
+
 # ============= RESPUESTA PRÁCTICA =============
 
 def obtener_respuesta_practica(question, score=None):
@@ -228,7 +323,7 @@ def handle_query():
             return jsonify({"respuesta": "No encontré normativa aplicable. No me baso en ningún artículo."})
 
         # ========== RESPUESTAS ==========
-        respuesta_legal, tokens_usados = generate_legal_response(question, context_docs)
+        respuesta_legal, tokens_usados = generate_legal_response5(question, context_docs)
 
         index_respuestas_abogados = pc.Index("indice-respuestas-abogados")
         embedding = embed_model._get_query_embedding(question)
