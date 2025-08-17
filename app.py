@@ -624,7 +624,9 @@ def test_contexto_practico():
 # ============= probar 5 =============
 import time
 
-@app.route("/gpt5/test", methods=["GET"])
+import time
+
+@app.route("/gpt5/test1", methods=["GET"])
 def gpt5_test():
     try:
         prompt = request.args.get("q", "Di 'pong' y el nombre exacto del modelo que estás usando.")
@@ -635,8 +637,7 @@ def gpt5_test():
                 {"role": "system", "content": "Eres un probador mínimo. Responde en una sola línea."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0,
-            max_completion_tokens=50  # <- clave para GPT-5 (NO usar max_tokens)
+            temperature=0   # ← SIN max_tokens / SIN max_completion_tokens
         )
         latency_ms = int((time.time() - t0) * 1000)
         content = resp.choices[0].message.content.strip()
@@ -651,11 +652,8 @@ def gpt5_test():
             "sample": content
         })
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
 
 
 
