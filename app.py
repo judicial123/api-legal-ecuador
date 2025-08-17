@@ -626,11 +626,6 @@ import time
 
 @app.route("/gpt5/test", methods=["GET"])
 def gpt5_test():
-    """
-    Prueba mínima de conectividad y modelo:
-    - Usa gpt-5-mini para responder "pong" y reporta latencia, tokens y modelo devuelto por la API.
-    - Puedes pasar ?q= ... para personalizar el prompt.
-    """
     try:
         prompt = request.args.get("q", "Di 'pong' y el nombre exacto del modelo que estás usando.")
         t0 = time.time()
@@ -641,7 +636,7 @@ def gpt5_test():
                 {"role": "user", "content": prompt}
             ],
             temperature=0,
-            max_tokens=50
+            max_completion_tokens=50  # <- clave para GPT-5 (NO usar max_tokens)
         )
         latency_ms = int((time.time() - t0) * 1000)
         content = resp.choices[0].message.content.strip()
@@ -659,15 +654,10 @@ def gpt5_test():
         return jsonify({
             "ok": False,
             "error": str(e),
-            "traceback": traceback.format_exc(),
-            "env": {
-                "has_OPENAI_API_KEY": bool(CONFIG.get("OPENAI_API_KEY")),
-                "has_PINECONE_API_KEY": bool(CONFIG.get("PINECONE_API_KEY")),
-                "has_INDEX_NAME": bool(CONFIG.get("INDEX_NAME")),
-                "has_PINECONE_ENV": bool(CONFIG.get("PINECONE_ENV"))
-            }
+            "traceback": traceback.format_exc()
         }), 500
 
-        
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
