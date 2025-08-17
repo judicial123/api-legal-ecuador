@@ -621,5 +621,53 @@ def test_contexto_practico():
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
+# ============= probar 5 =============
+import time
+
+@app.route("/gpt5/test", methods=["GET"])
+def gpt5_test():
+    """
+    Prueba mínima de conectividad y modelo:
+    - Usa gpt-5-mini para responder "pong" y reporta latencia, tokens y modelo devuelto por la API.
+    - Puedes pasar ?q= ... para personalizar el prompt.
+    """
+    try:
+        prompt = request.args.get("q", "Di 'pong' y el nombre exacto del modelo que estás usando.")
+        t0 = time.time()
+        resp = openai_client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": "Eres un probador mínimo. Responde en una sola línea."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+            max_tokens=50
+        )
+        latency_ms = int((time.time() - t0) * 1000)
+        content = resp.choices[0].message.content.strip()
+        model_used = getattr(resp, "model", "gpt-5-mini")
+        tokens = resp.usage.total_tokens if getattr(resp, "usage", None) else None
+
+        return jsonify({
+            "ok": True,
+            "model": model_used,
+            "latency_ms": latency_ms,
+            "total_tokens": tokens,
+            "sample": content
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "env": {
+                "has_OPENAI_API_KEY": bool(CONFIG.get("OPENAI_API_KEY")),
+                "has_PINECONE_API_KEY": bool(CONFIG.get("PINECONE_API_KEY")),
+                "has_INDEX_NAME": bool(CONFIG.get("INDEX_NAME")),
+                "has_PINECONE_ENV": bool(CONFIG.get("PINECONE_ENV"))
+            }
+        }), 500
+
+        
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
