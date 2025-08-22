@@ -236,7 +236,6 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     max_out = int(CONFIG.get("MAX_TOKENS", 2000))
     temperature = float(CONFIG.get("TEMPERATURE", 0.3))
 
-    # ---------- Heurística operativa (para obligar tabla/multas/checklist) ----------
     q_lower = (question or "").lower()
     operativo_kw = [
         "contratar", "sut", "iess", "afiliación", "aportes", "finiquito", "décimo", "utilidades",
@@ -247,16 +246,18 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
 
     # ---------- 1) Sin documentos normativos → orientación general segura ----------
     if not context_docs:
-        system_prompt_fb = """
-Eres un abogado corporativo ecuatoriano. No tienes documentos normativos disponibles.
-Da orientación práctica y accionable para un gerente. NO cites artículos ni inventes montos/plazos.
-Tu respuesta DEBE comenzar EXACTAMENTE con: "no encontré normativa oficial, sin embargo".
-Longitud sugerida: 150–220 palabras. Tono claro y profesional. 
-Aclara que es orientación general y recomienda validación con abogado y fuentes oficiales (Función Judicial, SRI, IESS, MDT).
-        """.strip()
+        system_prompt_fb = (
+            "Eres un abogado corporativo ecuatoriano. No tienes documentos normativos disponibles.\n"
+            "Da orientación práctica y accionable para un gerente. NO cites artículos ni inventes montos/plazos.\n"
+            "Tu respuesta DEBE comenzar EXACTAMENTE con: \"no encontré normativa oficial, sin embargo\".\n"
+            "Longitud sugerida: 150–220 palabras. Tono claro y profesional.\n"
+            "Aclara que es orientación general y recomienda validación con abogado y fuentes oficiales (Función Judicial, SRI, IESS, MDT)."
+        )
 
-        # Si hay capa operativa, inclúyela como contexto no normativo
-        context_op = f"\n\nNOTAS OPERATIVAS (no normativo):\n{(contexto_practico or '')[:1000]}" if contexto_practico else ""
+        context_op = ""
+        if contexto_practico:
+            context_op = "\n\nNOTAS OPERATIVAS (no normativo):\n" + (contexto_practico[:1000])
+
         user_fb = f"Pregunta: {question}{context_op}"
 
         kwargs = dict(model=model, messages=[
@@ -281,7 +282,6 @@ Aclara que es orientación general y recomienda validación con abogado y fuente
         texto = (doc.get('texto') or '').strip()
         if not (codigo and art and texto):
             return None
-        # recorte a 600 chars para mini-citas
         return f"{codigo} Art.{art}: {texto[:600]}"
 
     legal_lines = []
@@ -293,48 +293,67 @@ Aclara que es orientación general y recomienda validación con abogado y fuente
     context_text = "DOCUMENTOS LEGALES (citar SOLO desde aquí en ⚖️ Fundamento legal):\n" + "\n".join(legal_lines[:24])
 
     if contexto_practico:
-        context_text += f"\n\nNOTAS OPERATIVAS (no normativo, no citar en ⚖️):\n{contexto_practico.strip()[:1200]}"
+        context_text += "\n\nNOTAS OPERATIVAS (no normativo, no citar en ⚖️):\n" + contexto_practico.strip()[:1200]
 
-    # ---------- 3) Contrato de salida obligatorio ----------
-    output_contract = f"""
-FORMATO OBLIGATORIO (no cambies títulos ni orden):
+    # ---------- 3) Bloques condicionales (SIN f-strings dentro) ----------
+    plazos_block = ""
+    multas_block = ""
+    checklist_block = ""
+    notas_block = ""
 
-📌 Resumen ejecutivo
-- 3–5 bullets, directos para gerencia.
+    if is_operativo:
+        plazos_block = (
+            "🗓️ Tabla de plazos y responsables\n"
+            "| Obligación | Plazo legal | Responsable | Norma [CÓDIGO Art.] |\n"
+            "|---|---|---|---|\n"
+            "(Usa “—” o “No consta en los documentos provistos” si el plazo no está en los documentos.)\n"
+        )
+        multas_block = (
+            "💸 Multas y consecuencias\n"
+            "- Bullets concisos. Si un monto/plazo NO está en los documentos, indica: “No consta en los documentos provistos”.\n"
+        )
+        checklist_block = (
+            "🧾 Checklist de documentos\n"
+            "- Lista accionable (PDF a guardar, avisos, respaldos).\n"
+        )
+    if contexto_practico:
+        notas_block = (
+            "🧩 Notas operativas (no normativo)\n"
+            "- (OPCIONAL) Buenas prácticas, pasos de plataformas (SUT/IESS/SRI), calendarios.\n"
+            "- No incluyas referencias legales aquí. Usa solo lo aportado como NOTAS OPERATIVAS.\n"
+        )
 
-{"🗓️ Tabla de plazos y responsables\n| Obligación | Plazo legal | Responsable | Norma [CÓDIGO Art.] |\n|---|---|---|---|\n(Usa “—” o “No consta en los documentos provistos” si el plazo no está en los documentos.)\n" if is_operativo else ""}
+    # ---------- 4) Contrato de salida (solo variables seguras en llaves) ----------
+    output_contract = (
+        "FORMATO OBLIGATORIO (no cambies títulos ni orden):\n\n"
+        "📌 Resumen ejecutivo\n"
+        "- 3–5 bullets, directos para gerencia.\n\n"
+        f"{plazos_block}"
+        f"{multas_block}"
+        "✅ Acciones inmediatas\n"
+        "- 3–6 pasos priorizados (“Hoy”, “Esta semana”, etc.).\n\n"
+        f"{checklist_block}"
+        "❌ Errores comunes\n"
+        "- 2–4 bullets.\n\n"
+        "⚖️ Fundamento legal\n"
+        "- CITA SOLO artículos de “DOCUMENTOS LEGALES”, con formato [CÓDIGO Art. N].\n"
+        "- Incluye 1–2 citas textuales CORTAS (10–25 palabras) por artículo usado, entre comillas.\n"
+        "- Cierra con: “Me baso en [artículos citados]”.\n\n"
+        f"{notas_block}"
+        "REGLAS DURAS:\n"
+        "- En ⚖️ Fundamento legal SOLO puedes citar lo que está en “DOCUMENTOS LEGALES”.\n"
+        "- La capa operativa va en “🧩 Notas operativas (no normativo)”.\n"
+        "- Si falta un dato en los documentos, NO lo inventes: usa “—” o “No consta en los documentos provistos”.\n"
+        "- Tono profesional, humano y directo. Longitud guía: 250–450 palabras si es operativa; 120–220 si es puntual."
+    )
 
-{"💸 Multas y consecuencias\n- Bullets concisos. Si un monto/plazo NO está en los documentos, indica: “No consta en los documentos provistos”.\n" if is_operativo else ""}
-
-✅ Acciones inmediatas
-- 3–6 pasos priorizados (“Hoy”, “Esta semana”, etc.).
-
-{"🧾 Checklist de documentos\n- Lista accionable (PDF a guardar, avisos, respaldos).\n" if is_operativo else ""}
-
-❌ Errores comunes
-- 2–4 bullets.
-
-⚖️ Fundamento legal
-- CITA SOLO artículos de “DOCUMENTOS LEGALES”, con formato [CÓDIGO Art. N].
-- Incluye 1–2 citas textuales CORTAS (10–25 palabras) por artículo usado, entre comillas.
-- Cierra con: “Me baso en [artículos citados]”.
-
-{"🧩 Notas operativas (no normativo)\n- (OPCIONAL) Buenas prácticas, pasos de plataformas (SUT/IESS/SRI), calendarios.\n- No incluyas referencias legales aquí. Usa solo lo aportado como NOTAS OPERATIVAS.\n" if contexto_practico else ""}
-
-REGLAS DURAS:
-- En ⚖️ Fundamento legal SOLO puedes citar lo que está en “DOCUMENTOS LEGALES”.
-- La capa operativa va en “🧩 Notas operativas (no normativo)”.
-- Si falta un dato en los documentos, NO lo inventes: usa “—” o “No consta en los documentos provistos”.
-- Tono profesional, humano y directo. Longitud guía: 250–450 palabras si es operativa; 120–220 si es puntual.
-""".strip()
-
-    system_prompt = """
-Eres un abogado corporativo ecuatoriano que asesora a gerentes ocupados.
-Objetivo: respuesta clara, accionable y sin jerga innecesaria.
-- Citas legales SOLO desde los documentos provistos.
-- La capa operativa (si existe) va en “🧩 Notas operativas (no normativo)”.
-- Cumple el FORMATO OBLIGATORIO exacto (títulos, orden y tabla si aplica).
-""".strip()
+    system_prompt = (
+        "Eres un abogado corporativo ecuatoriano que asesora a gerentes ocupados.\n"
+        "Objetivo: respuesta clara, accionable y sin jerga innecesaria.\n"
+        "- Citas legales SOLO desde los documentos provistos.\n"
+        "- La capa operativa (si existe) va en “🧩 Notas operativas (no normativo)”.\n"
+        "- Cumple el FORMATO OBLIGATORIO exacto (títulos, orden y tabla si aplica)."
+    )
 
     user_msg = f"Pregunta: {question}\n\n{context_text}\n\n{output_contract}"
 
@@ -352,7 +371,7 @@ Objetivo: respuesta clara, accionable y sin jerga innecesaria.
     respuesta = (resp.choices[0].message.content or "").strip()
     toks = resp.usage.total_tokens if getattr(resp, "usage", None) else 0
 
-    # ---------- 4) Quality Gate: verifica y corrige en una pasada si hace falta ----------
+    # ---------- 5) Quality Gate ----------
     def _has(title: str) -> bool:
         return re.search(rf"^{re.escape(title)}\s*$", respuesta, flags=re.IGNORECASE | re.MULTILINE) is not None
 
@@ -370,26 +389,17 @@ Objetivo: respuesta clara, accionable y sin jerga innecesaria.
     needs_closure = ("Art." in respuesta or "art." in respuesta) and "Me baso en [" not in respuesta
 
     if missing or needs_closure:
-        fix_instructions = []
+        parts = []
         if missing:
-            fix_instructions.append(f"FALTAN SECCIONES/FORMATO: {', '.join(missing)}.")
+            parts.append("FALTAN SECCIONES/FORMATO: " + ", ".join(missing) + ".")
         if needs_closure:
-            fix_instructions.append("Añade el cierre: “Me baso en [artículos citados]”.")
-        fix_prompt = f"""
-Corrige la respuesta para cumplir EXACTAMENTE el FORMATO OBLIGATORIO, sin inventar datos.
-Si algún dato no consta en los documentos, deja “—” o “No consta en los documentos provistos”.
-{ ' '.join(fix_instructions) }
-
-Pregunta: {question}
-
-{context_text}
-
-FORMATO OBLIGATORIO (repetición):
-{output_contract}
-
-RESPUESTA ACTUAL A CORREGIR:
-{respuesta}
-""".strip()
+            parts.append("Añade el cierre: “Me baso en [artículos citados]”.")
+        fix_prompt = (
+            "Corrige la respuesta para cumplir EXACTAMENTE el FORMATO OBLIGATORIO, sin inventar datos.\n"
+            "Si algún dato no consta en los documentos, deja “—” o “No consta en los documentos provistos”.\n"
+            + " ".join(parts)
+            + f"\n\nPregunta: {question}\n\n{context_text}\n\nFORMATO OBLIGATORIO (repetición):\n{output_contract}\n\nRESPUESTA ACTUAL A CORREGIR:\n{respuesta}"
+        )
 
         kwargs2 = dict(model=model, messages=[
             {"role": "system", "content": system_prompt},
@@ -407,9 +417,8 @@ RESPUESTA ACTUAL A CORREGIR:
             respuesta = respuesta2
             toks += resp2.usage.total_tokens if getattr(resp2, "usage", None) else 0
 
-    # ---------- 5) Post-guard: si hay citas y faltó el cierre legal, añádelo ----------
-    needs_closure_final = ("Art." in respuesta or "art." in respuesta) and "Me baso en [" not in respuesta
-    if needs_closure_final:
+    # ---------- 6) Post-guard ----------
+    if ("Art." in respuesta or "art." in respuesta) and "Me baso en [" not in respuesta:
         respuesta += "\n\nMe baso en [artículos citados]."
 
     return respuesta, toks
