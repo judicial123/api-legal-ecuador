@@ -223,81 +223,120 @@ Reglas de rigor:
 
 def generate_legal_response_empresario(question, context_docs, contexto_practico=None):
     """
-    Responde en estilo consultor empresarial:
-    - Decide automáticamente si responder breve (2–4 frases) o con bloques (resumen, riesgos, acciones).
-    - SOLO cita normativa presente en context_docs.
-    - Si no hay normativa aplicable: inicia EXACTAMENTE con 'no encontré normativa oficial, sin embargo' y da orientación general.
-    - Return: (respuesta:str, tokens_usados:int)
+    Responde en estilo consultor empresarial (Ecuador) buscando ~100/100 en rúbrica.
+    - MISMA FIRMA Y RETORNO: (respuesta:str, tokens_usados:int)
+    - Usa y CITA solo lo de context_docs en ⚖️ Fundamento legal (sin inventar).
+    - Integra lo operativo (SUT/IESS/SRI, pasos/fechas) únicamente en 🧩 Notas operativas (no normativo) si viene en `contexto_practico`.
+    - Si no hay normativa aplicable: inicia EXACTAMENTE con 'no encontré normativa oficial, sin embargo' y da orientación práctica.
     """
+    import re
+
     model = CONFIG.get("OPENAI_MODEL", "gpt-5-mini")
     is_gpt5 = str(model).startswith("gpt-5")
     max_out = int(CONFIG.get("MAX_TOKENS", 2000))
+    temperature = float(CONFIG.get("TEMPERATURE", 0.3))
 
-    # 1) Sin documentos normativos → orientación general
+    # ---------- Heurística operativa (para obligar tabla/multas/checklist) ----------
+    q_lower = (question or "").lower()
+    operativo_kw = [
+        "contratar", "sut", "iess", "afiliación", "aportes", "finiquito", "décimo", "utilidades",
+        "rdep", "ats", "plazo", "plazos", "multa", "multas", "sanción", "sanciones", "procedimiento",
+        "paso a paso", "checklist", "documentos", "obligación", "retención", "sri", "horarios", "reducción de jornada"
+    ]
+    is_operativo = any(k in q_lower for k in operativo_kw) or bool(contexto_practico)
+
+    # ---------- 1) Sin documentos normativos → orientación general segura ----------
     if not context_docs:
         system_prompt_fb = """
 Eres un abogado corporativo ecuatoriano. No tienes documentos normativos disponibles.
 Da orientación práctica y accionable para un gerente. NO cites artículos ni inventes montos/plazos.
 Tu respuesta DEBE comenzar EXACTAMENTE con: "no encontré normativa oficial, sin embargo".
-Longitud sugerida: 120–220 palabras.
-Incluye bullets claros solo si aportan.
-Aclara que es orientación general y recomienda validación con un abogado y fuentes oficiales (Función Judicial, SRI, IESS, MDT).
+Longitud sugerida: 150–220 palabras. Tono claro y profesional. 
+Aclara que es orientación general y recomienda validación con abogado y fuentes oficiales (Función Judicial, SRI, IESS, MDT).
         """.strip()
-        user_fb = f"Pregunta: {question}"
+
+        # Si hay capa operativa, inclúyela como contexto no normativo
+        context_op = f"\n\nNOTAS OPERATIVAS (no normativo):\n{(contexto_practico or '')[:1000]}" if contexto_practico else ""
+        user_fb = f"Pregunta: {question}{context_op}"
+
         kwargs = dict(model=model, messages=[
             {"role": "system", "content": system_prompt_fb},
             {"role": "user", "content": user_fb}
         ])
         if is_gpt5:
-            kwargs["max_completion_tokens"] = min(max_out, 600)
+            kwargs["max_completion_tokens"] = min(max_out, 700)
         else:
-            kwargs["temperature"] = CONFIG.get("TEMPERATURE", 0.3)
-            kwargs["max_tokens"] = min(max_out, 600)
+            kwargs["temperature"] = temperature
+            kwargs["max_tokens"] = min(max_out, 700)
 
         resp = openai_client.chat.completions.create(**kwargs)
         txt = (resp.choices[0].message.content or "").strip()
         toks = resp.usage.total_tokens if getattr(resp, "usage", None) else 0
         return txt, toks
 
-    # 2) Con documentos normativos → estilo empresarial adaptable
-    #   Construimos el contexto normativo compacto y ordenado
-    context_text = "\nDOCUMENTOS LEGALES:\n" + "\n".join(
-        f"{doc.get('codigo','')} Art.{doc.get('articulo','')}: { (doc.get('texto','') or '')[:600] }"
-        for doc in context_docs
-        if (doc.get('codigo') and doc.get('articulo') and (doc.get('texto') or '').strip())
-    )
+    # ---------- 2) Construcción de contexto normativo compacto ----------
+    def _mk_line(doc):
+        codigo = (doc.get('codigo') or '').strip()
+        art = (doc.get('articulo') or '').strip()
+        texto = (doc.get('texto') or '').strip()
+        if not (codigo and art and texto):
+            return None
+        # recorte a 600 chars para mini-citas
+        return f"{codigo} Art.{art}: {texto[:600]}"
+
+    legal_lines = []
+    for doc in context_docs:
+        line = _mk_line(doc)
+        if line:
+            legal_lines.append(line)
+
+    context_text = "DOCUMENTOS LEGALES (citar SOLO desde aquí en ⚖️ Fundamento legal):\n" + "\n".join(legal_lines[:24])
 
     if contexto_practico:
-        context_text += f"\n\nNota operativa (no normativa): {contexto_practico}"
+        context_text += f"\n\nNOTAS OPERATIVAS (no normativo, no citar en ⚖️):\n{contexto_practico.strip()[:1200]}"
+
+    # ---------- 3) Contrato de salida obligatorio ----------
+    output_contract = f"""
+FORMATO OBLIGATORIO (no cambies títulos ni orden):
+
+📌 Resumen ejecutivo
+- 3–5 bullets, directos para gerencia.
+
+{"🗓️ Tabla de plazos y responsables\n| Obligación | Plazo legal | Responsable | Norma [CÓDIGO Art.] |\n|---|---|---|---|\n(Usa “—” o “No consta en los documentos provistos” si el plazo no está en los documentos.)\n" if is_operativo else ""}
+
+{"💸 Multas y consecuencias\n- Bullets concisos. Si un monto/plazo NO está en los documentos, indica: “No consta en los documentos provistos”.\n" if is_operativo else ""}
+
+✅ Acciones inmediatas
+- 3–6 pasos priorizados (“Hoy”, “Esta semana”, etc.).
+
+{"🧾 Checklist de documentos\n- Lista accionable (PDF a guardar, avisos, respaldos).\n" if is_operativo else ""}
+
+❌ Errores comunes
+- 2–4 bullets.
+
+⚖️ Fundamento legal
+- CITA SOLO artículos de “DOCUMENTOS LEGALES”, con formato [CÓDIGO Art. N].
+- Incluye 1–2 citas textuales CORTAS (10–25 palabras) por artículo usado, entre comillas.
+- Cierra con: “Me baso en [artículos citados]”.
+
+{"🧩 Notas operativas (no normativo)\n- (OPCIONAL) Buenas prácticas, pasos de plataformas (SUT/IESS/SRI), calendarios.\n- No incluyas referencias legales aquí. Usa solo lo aportado como NOTAS OPERATIVAS.\n" if contexto_practico else ""}
+
+REGLAS DURAS:
+- En ⚖️ Fundamento legal SOLO puedes citar lo que está en “DOCUMENTOS LEGALES”.
+- La capa operativa va en “🧩 Notas operativas (no normativo)”.
+- Si falta un dato en los documentos, NO lo inventes: usa “—” o “No consta en los documentos provistos”.
+- Tono profesional, humano y directo. Longitud guía: 250–450 palabras si es operativa; 120–220 si es puntual.
+""".strip()
 
     system_prompt = """
 Eres un abogado corporativo ecuatoriano que asesora a gerentes ocupados.
-Objetivo: respuesta clara, accionable y sin jerga innecesaria, usando SOLO los DOCUMENTOS LEGALES provistos.
-NUNCA inventes artículos, plazos, montos ni códigos. Si algo no está en los documentos, no lo afirmes.
-
-Comportamiento adaptativo (automático):
-- Si la duda es puntual/factual → responde en 2–4 frases claras + fundamento legal.
-- Si la duda impacta operaciones/compliance/contratos/sanciones → usa bloques:
-  📌 Resumen ejecutivo (3–5 bullets)
-  ⚠️ Riesgos/impacto (operación, costos, sanciones)
-  ✅ Acciones inmediatas (3–6 pasos priorizados)
-  ❌ Errores comunes (2–4 bullets)
-  ⚖️ Fundamento legal
-
-Reglas de citas:
-- En “⚖️ Fundamento legal”, menciona [CÓDIGO Art. N] por cada afirmación relevante.
-- Incluye 1–2 citas textuales CORTAS (10–25 palabras) por artículo usado, entre comillas.
-- Cierra SIEMPRE con: “Me baso en [artículos citados]”.
-- Si NO puedes citar ningún artículo de los documentos, entonces NO cites nada y responde con:
-  “no encontré normativa oficial, sin embargo” + orientación breve (120–220 palabras).
-
-Formato/tono:
-- Profesional, humano y directo. Usa emojis sobrios solo para señalizar (📌⚠️✅❌⚖️).
-- Evita redundancias. No repitas referencias legales fuera de la sección “⚖️ Fundamento legal”.
-- Longitud guía: 120–220 palabras si es simple; 250–450 si es complejo.
+Objetivo: respuesta clara, accionable y sin jerga innecesaria.
+- Citas legales SOLO desde los documentos provistos.
+- La capa operativa (si existe) va en “🧩 Notas operativas (no normativo)”.
+- Cumple el FORMATO OBLIGATORIO exacto (títulos, orden y tabla si aplica).
 """.strip()
 
-    user_msg = f"Pregunta: {question}\n\n{context_text}"
+    user_msg = f"Pregunta: {question}\n\n{context_text}\n\n{output_contract}"
 
     kwargs = dict(model=model, messages=[
         {"role": "system", "content": system_prompt},
@@ -306,85 +345,74 @@ Formato/tono:
     if is_gpt5:
         kwargs["max_completion_tokens"] = max_out
     else:
-        kwargs["temperature"] = CONFIG.get("TEMPERATURE", 0.3)
+        kwargs["temperature"] = temperature
         kwargs["max_tokens"] = max_out
 
     resp = openai_client.chat.completions.create(**kwargs)
     respuesta = (resp.choices[0].message.content or "").strip()
+    toks = resp.usage.total_tokens if getattr(resp, "usage", None) else 0
 
-    # 3) Post‑guard: si el modelo no incluyó el cierre legal teniendo normativa, lo reforzamos mínimamente
-    #    (No re‑llamamos al modelo: solo verificamos presencia de la coletilla cuando hay citas).
-    needs_closure = ("Art." in respuesta or "Art " in respuesta or "art." in respuesta) and "Me baso en [" not in respuesta
-    if needs_closure:
-        # Añade cierre simple si faltó (evitamos segunda inferencia para mantener latencia baja)
+    # ---------- 4) Quality Gate: verifica y corrige en una pasada si hace falta ----------
+    def _has(title: str) -> bool:
+        return re.search(rf"^{re.escape(title)}\s*$", respuesta, flags=re.IGNORECASE | re.MULTILINE) is not None
+
+    missing = []
+    must_sections = ["📌 Resumen ejecutivo", "✅ Acciones inmediatas", "❌ Errores comunes", "⚖️ Fundamento legal"]
+    if is_operativo:
+        must_sections[1:1] = ["🗓️ Tabla de plazos y responsables", "💸 Multas y consecuencias", "🧾 Checklist de documentos"]
+    for s in must_sections:
+        if not _has(s):
+            missing.append(s)
+
+    if is_operativo and "| Obligación | Plazo legal | Responsable | Norma" not in respuesta:
+        missing.append("🗓️ Tabla de plazos y responsables (tabla Markdown)")
+
+    needs_closure = ("Art." in respuesta or "art." in respuesta) and "Me baso en [" not in respuesta
+
+    if missing or needs_closure:
+        fix_instructions = []
+        if missing:
+            fix_instructions.append(f"FALTAN SECCIONES/FORMATO: {', '.join(missing)}.")
+        if needs_closure:
+            fix_instructions.append("Añade el cierre: “Me baso en [artículos citados]”.")
+        fix_prompt = f"""
+Corrige la respuesta para cumplir EXACTAMENTE el FORMATO OBLIGATORIO, sin inventar datos.
+Si algún dato no consta en los documentos, deja “—” o “No consta en los documentos provistos”.
+{ ' '.join(fix_instructions) }
+
+Pregunta: {question}
+
+{context_text}
+
+FORMATO OBLIGATORIO (repetición):
+{output_contract}
+
+RESPUESTA ACTUAL A CORREGIR:
+{respuesta}
+""".strip()
+
+        kwargs2 = dict(model=model, messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": fix_prompt}
+        ])
+        if is_gpt5:
+            kwargs2["max_completion_tokens"] = max_out
+        else:
+            kwargs2["temperature"] = max(0.2, temperature - 0.1)
+            kwargs2["max_tokens"] = max_out
+
+        resp2 = openai_client.chat.completions.create(**kwargs2)
+        respuesta2 = (resp2.choices[0].message.content or "").strip()
+        if respuesta2:
+            respuesta = respuesta2
+            toks += resp2.usage.total_tokens if getattr(resp2, "usage", None) else 0
+
+    # ---------- 5) Post-guard: si hay citas y faltó el cierre legal, añádelo ----------
+    needs_closure_final = ("Art." in respuesta or "art." in respuesta) and "Me baso en [" not in respuesta
+    if needs_closure_final:
         respuesta += "\n\nMe baso en [artículos citados]."
 
-    toks = resp.usage.total_tokens if getattr(resp, "usage", None) else 0
     return respuesta, toks
-
-# ============= RESPUESTA PRÁCTICA =============
-
-def obtener_respuesta_practica(question, score=None):
-    practical_index_name = "indice-respuestas-abogados"
-    practical_index = pc.Index(practical_index_name)
-
-    practical_vector_store = PineconeVectorStore(
-        pinecone_index=practical_index
-    )
-
-    practical_index_instance = VectorStoreIndex.from_vector_store(
-        vector_store=practical_vector_store,
-        service_context=service_context
-    )
-
-    engine = practical_index_instance.as_query_engine(similarity_top_k=1)
-    resultado = engine.query(question)
-
-    if not resultado.source_nodes:
-        return None
-
-    texto_practico = resultado.response.strip()
-
-    # Elegir introducción según el score
-    if score is not None and score < 0.75:
-        introduccion = (
-            "❗ La respuesta no responde directamente a la pregunta del usuario.\n"
-            "- Introduce con una frase como:\n"
-            "  \"Es difícil indicarte si [reformula aquí la intención del usuario], en este caso es importante que un abogado experto te asesore. Sin embargo, puedo decirte que...\"\n"
-            "- Reformula después el contenido original como referencia general.\n"
-            "- No afirmes nada que no esté expresamente en el texto original.\n"
-        )
-    else:
-        introduccion = (
-            "✅ La respuesta es clara y útil para la pregunta del usuario:\n"
-            "- Reformúlala sin alterar el mensaje, con un tono claro, amable y profesional.\n"
-        )
-
-    # Prompt final
-    prompt = (
-        "Reformula esta respuesta práctica legal para que suene humana, empática, cercana y útil para alguien sin conocimientos jurídicos. Usa segunda persona. Evalúa si responde o no directamente a la siguiente pregunta:\n\n"
-        f"🧑‍⚖️ Pregunta del usuario: \"{question}\"\n\n"
-        f"{introduccion}\n"
-        "🔒 Reglas adicionales:\n"
-        "- Conserva enlaces web útiles como http://consultas.funcionjudicial.gob.ec si están presentes en el texto original.\n"
-        "- NO agregues enlaces si no están.\n"
-        "- Elimina nombres propios, montos específicos, fechas y datos sensibles.\n\n"
-        f"Texto original:\n{texto_practico}"
-    )
-
-    # Llamada a OpenAI
-    reformulado = openai_client.chat.completions.create(
-        model=CONFIG["OPENAI_MODEL"],
-        messages=[
-            {"role": "system", "content": "Eres un asistente legal empático que habla en tono claro y humano."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.4,
-        max_tokens=800
-    )
-
-    return reformulado.choices[0].message.content.strip()
-
 
 # ============= ENDPOINT PRINCIPAL =============
 @app.route("/query", methods=["GET", "POST"])
