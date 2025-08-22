@@ -219,6 +219,109 @@ Reglas de rigor:
     tokens_usados = response.usage.total_tokens if getattr(response, "usage", None) else 0
     return respuesta, tokens_usados
 
+# ===============  enpresario ===============
+
+def generate_legal_response_empresario(question, context_docs, contexto_practico=None):
+    """
+    Responde en estilo consultor empresarial:
+    - Decide automáticamente si responder breve (2–4 frases) o con bloques (resumen, riesgos, acciones).
+    - SOLO cita normativa presente en context_docs.
+    - Si no hay normativa aplicable: inicia EXACTAMENTE con 'no encontré normativa oficial, sin embargo' y da orientación general.
+    - Return: (respuesta:str, tokens_usados:int)
+    """
+    model = CONFIG.get("OPENAI_MODEL", "gpt-5-mini")
+    is_gpt5 = str(model).startswith("gpt-5")
+    max_out = int(CONFIG.get("MAX_TOKENS", 2000))
+
+    # 1) Sin documentos normativos → orientación general
+    if not context_docs:
+        system_prompt_fb = """
+Eres un abogado corporativo ecuatoriano. No tienes documentos normativos disponibles.
+Da orientación práctica y accionable para un gerente. NO cites artículos ni inventes montos/plazos.
+Tu respuesta DEBE comenzar EXACTAMENTE con: "no encontré normativa oficial, sin embargo".
+Longitud sugerida: 120–220 palabras.
+Incluye bullets claros solo si aportan.
+Aclara que es orientación general y recomienda validación con un abogado y fuentes oficiales (Función Judicial, SRI, IESS, MDT).
+        """.strip()
+        user_fb = f"Pregunta: {question}"
+        kwargs = dict(model=model, messages=[
+            {"role": "system", "content": system_prompt_fb},
+            {"role": "user", "content": user_fb}
+        ])
+        if is_gpt5:
+            kwargs["max_completion_tokens"] = min(max_out, 600)
+        else:
+            kwargs["temperature"] = CONFIG.get("TEMPERATURE", 0.3)
+            kwargs["max_tokens"] = min(max_out, 600)
+
+        resp = openai_client.chat.completions.create(**kwargs)
+        txt = (resp.choices[0].message.content or "").strip()
+        toks = resp.usage.total_tokens if getattr(resp, "usage", None) else 0
+        return txt, toks
+
+    # 2) Con documentos normativos → estilo empresarial adaptable
+    #   Construimos el contexto normativo compacto y ordenado
+    context_text = "\nDOCUMENTOS LEGALES:\n" + "\n".join(
+        f"{doc.get('codigo','')} Art.{doc.get('articulo','')}: { (doc.get('texto','') or '')[:600] }"
+        for doc in context_docs
+        if (doc.get('codigo') and doc.get('articulo') and (doc.get('texto') or '').strip())
+    )
+
+    if contexto_practico:
+        context_text += f"\n\nNota operativa (no normativa): {contexto_practico}"
+
+    system_prompt = """
+Eres un abogado corporativo ecuatoriano que asesora a gerentes ocupados.
+Objetivo: respuesta clara, accionable y sin jerga innecesaria, usando SOLO los DOCUMENTOS LEGALES provistos.
+NUNCA inventes artículos, plazos, montos ni códigos. Si algo no está en los documentos, no lo afirmes.
+
+Comportamiento adaptativo (automático):
+- Si la duda es puntual/factual → responde en 2–4 frases claras + fundamento legal.
+- Si la duda impacta operaciones/compliance/contratos/sanciones → usa bloques:
+  📌 Resumen ejecutivo (3–5 bullets)
+  ⚠️ Riesgos/impacto (operación, costos, sanciones)
+  ✅ Acciones inmediatas (3–6 pasos priorizados)
+  ❌ Errores comunes (2–4 bullets)
+  ⚖️ Fundamento legal
+
+Reglas de citas:
+- En “⚖️ Fundamento legal”, menciona [CÓDIGO Art. N] por cada afirmación relevante.
+- Incluye 1–2 citas textuales CORTAS (10–25 palabras) por artículo usado, entre comillas.
+- Cierra SIEMPRE con: “Me baso en [artículos citados]”.
+- Si NO puedes citar ningún artículo de los documentos, entonces NO cites nada y responde con:
+  “no encontré normativa oficial, sin embargo” + orientación breve (120–220 palabras).
+
+Formato/tono:
+- Profesional, humano y directo. Usa emojis sobrios solo para señalizar (📌⚠️✅❌⚖️).
+- Evita redundancias. No repitas referencias legales fuera de la sección “⚖️ Fundamento legal”.
+- Longitud guía: 120–220 palabras si es simple; 250–450 si es complejo.
+""".strip()
+
+    user_msg = f"Pregunta: {question}\n\n{context_text}"
+
+    kwargs = dict(model=model, messages=[
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg}
+    ])
+    if is_gpt5:
+        kwargs["max_completion_tokens"] = max_out
+    else:
+        kwargs["temperature"] = CONFIG.get("TEMPERATURE", 0.3)
+        kwargs["max_tokens"] = max_out
+
+    resp = openai_client.chat.completions.create(**kwargs)
+    respuesta = (resp.choices[0].message.content or "").strip()
+
+    # 3) Post‑guard: si el modelo no incluyó el cierre legal teniendo normativa, lo reforzamos mínimamente
+    #    (No re‑llamamos al modelo: solo verificamos presencia de la coletilla cuando hay citas).
+    needs_closure = ("Art." in respuesta or "Art " in respuesta or "art." in respuesta) and "Me baso en [" not in respuesta
+    if needs_closure:
+        # Añade cierre simple si faltó (evitamos segunda inferencia para mantener latencia baja)
+        respuesta += "\n\nMe baso en [artículos citados]."
+
+    toks = resp.usage.total_tokens if getattr(resp, "usage", None) else 0
+    return respuesta, toks
+
 # ============= RESPUESTA PRÁCTICA =============
 
 def obtener_respuesta_practica(question, score=None):
@@ -356,6 +459,78 @@ def handle_query():
     except Exception as e:
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
+
+
+# ============= ENDPOINT PRINCIPAL =============
+@app.route("/queryEmpresario", methods=["GET", "POST"])
+def handle_query_empresario():
+    try:
+        question = request.args.get("question", "").strip() if request.method == "GET" else request.get_json().get("question", "").strip()
+        if not question:
+            return jsonify({"error": "Se requiere 'question'"}), 400
+
+        # ========== CONTEXTO LEGAL ==========
+        query_engine = index.as_query_engine(similarity_top_k=TOP_K_RESULTS)
+        pinecone_response = query_engine.query(question)
+
+        context_docs = []
+        biografia_juridica = {"alta": [], "media": [], "baja": []}
+
+        total_docs = len(pinecone_response.source_nodes)
+        alta_limite = int(total_docs * 0.3)
+        media_limite = int(total_docs * 0.6)
+
+        for i, node in enumerate(pinecone_response.source_nodes):
+            metadata = getattr(node.node, 'metadata', {})
+            codigo = metadata.get('code', '')
+            articulo = metadata.get('article', '')
+            texto = getattr(node.node, 'text', '') or metadata.get("text", '')
+            texto = texto.strip()
+
+            doc_data = {"codigo": codigo, "articulo": articulo, "texto": texto}
+            context_docs.append(doc_data)
+
+            if i < alta_limite:
+                biografia_juridica["alta"].append(doc_data)
+            elif i < media_limite:
+                biografia_juridica["media"].append(doc_data)
+            else:
+                biografia_juridica["baja"].append(doc_data)
+
+      
+        # ========== RESPUESTAS ==========
+        respuesta_legal, tokens_usados = generate_legal_response_empresario(question, context_docs)
+
+        index_respuestas_abogados = pc.Index("indice-respuestas-abogados")
+        embedding = embed_model._get_query_embedding(question)
+        similares = index_respuestas_abogados.query(vector=embedding, top_k=1, include_metadata=True)
+
+        respuesta_practica_reformulada = None
+
+        if similares.get("matches"):
+            match = similares["matches"][0]
+            score = match.get("score", 0)
+            if score >= 0.6:
+                respuesta_practica_reformulada = obtener_respuesta_practica(question, score=score)
+            else:
+                respuesta_practica_reformulada = None
+
+        # ========== UNIFICAR RESPUESTA ==========
+        bloques = []
+
+        if respuesta_practica_reformulada:
+            bloques.append("📌 Recomendación práctica:\n" + respuesta_practica_reformulada.strip())
+
+        bloques.append("⚖️ Fundamento legal:\n" + respuesta_legal.strip())
+
+        return jsonify({
+            "respuesta": "\n\n---\n\n".join(bloques),
+            "biografia_juridica": biografia_juridica,
+            "tokens_usados": {"total_tokens": tokens_usados}
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 import tiktoken
 
