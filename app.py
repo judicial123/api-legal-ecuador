@@ -228,13 +228,12 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     - Return: (respuesta:str, tokens_usados:int)
 
     Comportamiento:
-    - SIEMPRE ejecuta Google CSE limitado a gob.ec y arma guía ejecutiva completa.
-    - Responde explícitamente a la pregunta del usuario (bloque inicial “🧭 Respuesta ejecutiva”).
-    - Si hay context_docs, agrega sección final ⚖️ Fundamento legal usando SOLO esos artículos.
-    - Usa flujo de 2 etapas: Prompt Builder → Answer Writer + Quality Gate reforzado.
+    - Prioriza SIEMPRE tus context_docs para razonar (LEGAL_FACTS) y cita inline [CÓDIGO Art. N] cuando uses esos hechos.
+    - Complementa con Google CSE limitado a gob.ec para plazos/trámites/operativa.
+    - Writer NO genera ⚖️ Fundamento legal (lo agregamos nosotros desde context_docs).
+    - Quality gate: sin placeholders, tabla presente, ≥3 fuentes gob.ec, y (si hay context_docs) ≥2 citas inline válidas en “🧭 Respuesta ejecutiva”.
     """
     import os, json, re, html
-    from urllib.parse import urlparse
     import requests
 
     model = CONFIG.get("OPENAI_MODEL", "gpt-5-mini")
@@ -278,9 +277,8 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         out, seen = [], set()
         for r in results:
             u = r.get("link") or ""
-            if u and u not in seen:
-                out.append(r)
-                seen.add(u)
+            if u and (u not in seen):
+                out.append(r); seen.add(u)
             if len(out) >= cap:
                 break
         return out
@@ -334,30 +332,35 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
             missing.append("🗓️ Tabla de plazos y responsables (tabla Markdown)")
         return missing
 
-    def _answer_first_ok(txt):
-        # Busca la sección y valida que el primer bullet exprese postura (sí/no/depende/legal).
-        m = re.search(r"🧭\s*Respuesta\s+ejecutiva\s*(.+?)(?:\n\n[🗓️💸✅🧾❌📚⚖️]|$)", txt, flags=re.IGNORECASE | re.DOTALL)
-        sec = m.group(1) if m else ""
-        fb = re.search(r"^\s*[-•]\s*(.+)$", sec, flags=re.MULTILINE)
-        if not fb:
-            return False
-        bullet = fb.group(1).strip().lower()
-        keywords = ["sí", "si,", "no", "depende", "es legal", "no es legal", "permitido", "prohibido", "puedes", "no puedes"]
-        return any(k in bullet for k in keywords)
+    def _has_forbidden(txt):
+        forbidden = [
+            "Lorem ipsum", "No se puede proporcionar", "información adicional",
+            "Departamento X", "Departamento Y", "Fuente 1", "Fuente 2"
+        ]
+        return any(f.lower() in txt.lower() for f in forbidden)
 
-    tokens_total = 0
+    # ----------------- Preparar LEGAL_FACTS (prioridad #1) -----------------
+    legal_facts_lines, allowed_refs = [], set()
+    for d in (context_docs or [])[:12]:
+        cod = (d.get("codigo") or "").strip()
+        art = (d.get("articulo") or "").strip()
+        txt = (d.get("texto") or "").strip()
+        if cod and art and txt:
+            ref = cod + " Art. " + art
+            allowed_refs.add(ref)
+            legal_facts_lines.append(ref + ": " + txt[:600])
+    legal_facts_text = "\n".join(legal_facts_lines) if legal_facts_lines else "(sin documentos)"
 
     # ----------------- (1) PROMPT BUILDER -----------------
     builder_system = (
         "Eres un “Prompt Architect” legal para Ecuador. Convierte una pregunta de negocio en un encargo perfecto "
-        "para un abogado corporativo que responderá a gerentes/contabilidad/RR.HH.\n"
+        "para un abogado corporativo (gerencia/RRHH/contabilidad).\n"
         "Reglas:\n"
-        "- Siempre incluir búsqueda web limitada a dominios oficiales gob.ec (SRI, IESS, trabajo.gob.ec, etc.).\n"
-        "- Maximiza utilidad para un gerente: answer-first, pasos, plazos, multas, checklist, errores comunes.\n"
-        "- Si el lenguaje implica urgencia temporal (hoy/esta semana/mañana), marca timeline_required=true.\n"
-        "- Si no hay dato en fuentes, usar “—”.\n"
-        "- Tono profesional y directo. Evita jerga.\n"
-        "Salida en JSON con claves: queries_gob_ec (3–6), must_rules (4–8), answer_hints (3–6), timeline_required (bool).\n"
+        "- Incluir búsqueda web en dominios oficiales gob.ec.\n"
+        "- Maximiza utilidad: answer-first explícito, pasos, plazos, multas, checklist, errores comunes.\n"
+        "- Si el texto sugiere urgencia temporal, timeline_required=true.\n"
+        "- Si un dato no consta en fuentes, usa “—”.\n"
+        "Devuelve SOLO JSON válido con: queries_gob_ec (3–6), must_rules (4–8), answer_hints (3–6), timeline_required (bool)."
     )
     builder_user = 'user_question: """' + (question or "") + '"""'
 
@@ -371,6 +374,7 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         kwargs_b["temperature"] = max(0.2, temperature - 0.1)
         kwargs_b["max_tokens"] = 350
 
+    tokens_total = 0
     try:
         br = openai_client.chat.completions.create(**kwargs_b)
         builder_txt = (br.choices[0].message.content or "").strip()
@@ -382,31 +386,26 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     except Exception:
         bj = {}
 
+    base_q = (question or "")
     queries = bj.get("queries_gob_ec") or [
-        (question or ""),
-        (question or "") + " sitio: gob.ec",
-        (question or "") + " Ecuador SRI",
-        (question or "") + " Ecuador IESS",
-        (question or "") + " Ministerio del Trabajo SUT",
+        base_q,
+        base_q + " sitio:gob.ec",
+        base_q + " Ministerio del Trabajo SUT site:trabajo.gob.ec",
+        base_q + " IESS site:iess.gob.ec",
+        base_q + " SRI formulario site:sri.gob.ec",
     ]
     must_rules = bj.get("must_rules") or [
         "Responder explícitamente la pregunta en la primera sección.",
         "No inventar plazos ni montos; usar “—” si no consta.",
-        "Citar solo dominios gob.ec en Fuentes.",
+        "Citar sólo dominios gob.ec en 📚 Fuentes consultadas.",
         "Entregar tabla de plazos y responsables.",
-        "Incluir checklist y errores comunes."
+        "Incluir checklist y errores comunes.",
+        "Cuando uses LEGAL_FACTS, añade referencia [CÓDIGO Art. N] al final de la frase."
     ]
     answer_hints = bj.get("answer_hints") or []
     timeline_required = bool(bj.get("timeline_required", False))
 
-    # Heurística adicional (eleva calidad en temas frecuentes sin romper escalabilidad)
-    ql = (question or "").lower()
-    if any(p in ql for p in ["4 dias", "4 días", "4x10", "10 horas", "10h"]):
-        must_rules.append("Para jornada 4×10 o 10 horas/día, evalúa Art. 47.2 (jornada prolongada) además de 47, 50 y 55 CT.")
-        answer_hints.append("Límites: ≤10h/día y ≤40h/sem; acuerdo escrito; publicar/registrar horario; recargos si excedes; descanso 48h.")
-        queries.append((question or "") + " jornada prolongada 47.2 trabajo.gob.ec")
-
-    # ----------------- (2) WEB CSE -----------------
+    # ----------------- (2) WEB CSE (prioridad #2) -----------------
     all_results = []
     for q in queries[:6]:
         if q and isinstance(q, str):
@@ -425,27 +424,19 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         "📚 Fuentes consultadas"
     ]
     writer_system = (
-        "Eres un abogado corporativo ecuatoriano que asesora a gerentes ocupados.\n"
+        "Eres un abogado corporativo ecuatoriano para gerentes.\n"
         "Tarea: responder explícitamente la pregunta y entregar una GUÍA EJECUTIVA completa.\n"
+        "Prioridad de fuentes:\n"
+        "1) LEGAL_FACTS (tus artículos). Cuando uses un hecho de LEGAL_FACTS, cierra la frase con [CÓDIGO Art. N].\n"
+        "2) WEB_SNIPPETS (gob.ec) para plazos, trámites, operativa y ejemplos.\n"
         "Reglas duras:\n"
-        "- Usa solo información de WEB_SNIPPETS (dominios gob.ec) para cuerpo, plazos, pasos, multas, checklist.\n"
-        "- Si un dato no aparece, escribe “—”. Nunca inventes.\n"
-        "- Cita fuentes al final en 📚 Fuentes consultadas (título + dominio, sin repetir dominios idénticos y sin URLs).\n"
-        "- Si CONTEXT_DOCS existe, agrega al final ⚖️ Fundamento legal con [CÓDIGO Art. N] + 1–2 citas textuales cortas por artículo y cierra con “Me baso en [artículos citados]”.\n"
-        "- Tono profesional, directo, answer-first. Si timeline_required es true, organiza acciones por Día 1… Día 5/7 dentro de “✅ Acciones inmediatas”.\n"
-        "Salida: texto con los encabezados EXACTOS siguientes:\n"
+        "- Si un dato no aparece en LEGAL_FACTS ni en WEB_SNIPPETS, escribe “—”.\n"
+        "- Prohibido ‘rellenos’: “No se puede proporcionar…”, “Lorem ipsum…”, “Departamento X/Y”, “Fuente 1/2”.\n"
+        "- Cita fuentes al final (📚) con Título + dominio (sin repetir dominios). No generes ‘⚖️ Fundamento legal’.\n"
+        "- Tono profesional y directo. Si TIMELINE_REQUIRED=true, organiza acciones por Día 1… Día 7 en “✅ Acciones inmediatas”.\n"
+        "Salida: usa EXACTAMENTE estos encabezados (en este orden):\n"
         + "\n".join(required_sections)
-        + ("\n" + "⚖️ Fundamento legal" if context_docs else "")
     )
-
-    docs_compact_lines = []
-    for d in (context_docs or [])[:12]:
-        cod = (d.get("codigo") or "").strip()
-        art = (d.get("articulo") or "").strip()
-        txt = (d.get("texto") or "").strip()
-        if cod and art and txt:
-            docs_compact_lines.append(cod + " Art." + art + ": " + txt[:600])
-    context_docs_text = "\n".join(docs_compact_lines) if docs_compact_lines else "(sin documentos)"
 
     sections_text = "\n".join(["- " + s for s in required_sections])
     must_rules_text = "\n".join(["- " + r for r in must_rules])
@@ -453,13 +444,13 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
 
     writer_user = (
         "PREGUNTA:\n" + (question or "") +
+        "\n\nLEGAL_FACTS (prioridad #1, cita como [CÓDIGO Art. N] cuando apliques):\n" + legal_facts_text +
+        "\n\nWEB_SNIPPETS (prioridad #2, sólo gob.ec):\n" + web_context_text +
         "\n\nSECTIONS (usar exactamente estos encabezados):\n" + sections_text +
-        ("\n- ⚖️ Fundamento legal" if context_docs else "") +
         "\n\nMUST_RULES:\n" + must_rules_text +
         "\n\nANSWER_HINTS:\n" + hints_text +
         "\n\nTIMELINE_REQUIRED: " + ("true" if timeline_required else "false") +
-        "\n\nWEB_SNIPPETS (resumidos, solo gob.ec):\n" + web_context_text +
-        "\n\nCONTEXT_DOCS (usar SOLO en ⚖️):\n" + context_docs_text
+        "\n\nNOTA: El bloque ‘⚖️ Fundamento legal’ lo añadirá el sistema después, con citas textuales de LEGAL_FACTS."
     )
 
     kwargs_w = dict(model=model, messages=[
@@ -474,26 +465,47 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
 
     wr = openai_client.chat.completions.create(**kwargs_w)
     respuesta = (wr.choices[0].message.content or "").strip()
-    tokens_total = (tokens_total + wr.usage.total_tokens) if getattr(wr, "usage", None) else tokens_total
+    tokens_total = (wr.usage.total_tokens if getattr(wr, "usage", None) else 0) + tokens_total
 
     # ----------------- (4) Quality Gate -----------------
     missing = _ensure_sections(respuesta, required_sections)
-    needs_answer_first = not _answer_first_ok(respuesta)
+    too_few_sources = ("📚 Fuentes consultadas" in respuesta) and (len(re.findall(r"^- ", respuesta.split("📚 Fuentes consultadas",1)[-1], flags=re.MULTILINE)) < 3)
+    bad_text = _has_forbidden(respuesta)
 
-    if missing or needs_answer_first:
+    # Si hay context_docs, requerimos ≥2 citas inline válidas en “🧭 Respuesta ejecutiva”
+    need_inline_legal = False
+    if context_docs and allowed_refs:
+        exec_block = respuesta.split("🧭 Respuesta ejecutiva", 1)
+        inline_ok = 0
+        if len(exec_block) > 1:
+            tail = exec_block[1]
+            # Busca referencias [CÓDIGO Art. N] y verifica que existan en allowed_refs
+            for m in re.findall(r"\[([^\[\]]+? Art\. ?\d+)\]", tail):
+                if m.strip() in allowed_refs:
+                    inline_ok += 1
+        if inline_ok < 2:
+            need_inline_legal = True
+
+    if missing or too_few_sources or bad_text or need_inline_legal:
+        problems = []
+        if missing: problems.append("Faltan secciones: " + ", ".join(missing))
+        if too_few_sources: problems.append("Hay menos de 3 fuentes en 📚.")
+        if bad_text: problems.append("Se detectaron frases prohibidas/‘relleno’.")
+        if need_inline_legal: problems.append("Faltan ≥2 citas inline [CÓDIGO Art. N] válidas en ‘🧭 Respuesta ejecutiva’.")
         fix_instr = (
-            "Corrige para cumplir EXACTAMENTE los encabezados requeridos, sin inventar. "
-            "Usa “—” cuando el dato no conste en las fuentes. "
-            "La primera viñeta de “🧭 Respuesta ejecutiva” DEBE tomar postura clara (p. ej., “Sí, con condiciones: …” / “No, porque …” / “Depende de …, si … entonces …”)."
+            "Corrige para cumplir EXACTAMENTE los encabezados requeridos y las reglas duras.\n"
+            "- Usa LEGAL_FACTS como fuente principal; cuando apliques un hecho legal, cierra la frase con [CÓDIGO Art. N].\n"
+            "- Asegura ≥2 citas inline válidas en ‘🧭 Respuesta ejecutiva’.\n"
+            "- Prohibido texto de relleno (‘No se puede proporcionar…’, ‘Lorem ipsum…’, ‘Departamento X/Y’, ‘Fuente 1/2’).\n"
+            "- Asegura la tabla y al menos 3 fuentes (dominios gob.ec). Emplea “—” si falta un dato.\n"
+            "- NO generes ‘⚖️ Fundamento legal’. Ese bloque lo añadirá el sistema."
         )
         fix_user = (
-            ("Faltan secciones: " + ", ".join(missing) + "\n") if missing else "" +
-            ("La respuesta no es answer-first en la primera viñeta.\n" if needs_answer_first else "") +
-            "\nRespuesta actual:\n" + respuesta +
-            "\n\nPREGUNTA:\n" + (question or "") +
+            "; ".join(problems) + "\n\n"
+            "PREGUNTA:\n" + (question or "") +
+            "\n\nLEGAL_FACTS (prioridad #1):\n" + legal_facts_text +
             "\n\nWEB_SNIPPETS (gob.ec):\n" + web_context_text +
-            "\n\nSECTIONS requeridos:\n" + sections_text +
-            ("\n- ⚖️ Fundamento legal" if context_docs else "")
+            "\n\nSECTIONS requeridos (no cambies títulos):\n" + "\n".join(["- " + s for s in required_sections])
         )
         kwargs_fix = dict(model=model, messages=[
             {"role": "system", "content": fix_instr},
@@ -509,19 +521,23 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         fixed = (wr2.choices[0].message.content or "").strip()
         if fixed:
             respuesta = fixed
-            tokens_total = (tokens_total + wr2.usage.total_tokens) if getattr(wr2, "usage", None) else tokens_total
+            tokens_total += wr2.usage.total_tokens if getattr(wr2, "usage", None) else 0
 
     # ----------------- (5) Notas operativas opcionales -----------------
     if contexto_practico:
         respuesta += "\n\n🧩 Notas operativas (no normativo)\n" + (contexto_practico.strip()[:1200])
 
-    # ----------------- (6) Fundamento legal desde tus docs (append si faltó) -----------------
-    if context_docs and ("⚖️ Fundamento legal" not in respuesta):
+    # ----------------- (6) Fundamento legal desde tus docs -----------------
+    if context_docs:
         bloque = _mk_fundamento(context_docs)
         if bloque:
+            # Si el Writer metió uno (no debería), lo reemplazamos
+            if "⚖️ Fundamento legal" in respuesta:
+                respuesta = re.split(r"\n?⚖️ Fundamento legal.*", respuesta, maxsplit=1)[0].rstrip()
             respuesta += "\n\n" + bloque
 
     return respuesta, tokens_total
+
 
 
 
