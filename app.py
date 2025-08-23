@@ -231,7 +231,7 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     - SIEMPRE ejecuta Google CSE limitado a gob.ec y arma guía ejecutiva completa.
     - Responde explícitamente a la pregunta del usuario (bloque inicial “🧭 Respuesta ejecutiva”).
     - Si hay context_docs, agrega sección final ⚖️ Fundamento legal usando SOLO esos artículos.
-    - Usa flujo de 2 etapas: Prompt Builder → Answer Writer.
+    - Usa flujo de 2 etapas: Prompt Builder → Answer Writer + Quality Gate reforzado.
     """
     import os, json, re, html
     from urllib.parse import urlparse
@@ -275,7 +275,6 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         return items
 
     def _mk_snippets(results, cap=8):
-        """Devuelve lista de dicts únicos por URL (máx cap)."""
         out, seen = [], set()
         for r in results:
             u = r.get("link") or ""
@@ -335,6 +334,17 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
             missing.append("🗓️ Tabla de plazos y responsables (tabla Markdown)")
         return missing
 
+    def _answer_first_ok(txt):
+        # Busca la sección y valida que el primer bullet exprese postura (sí/no/depende/legal).
+        m = re.search(r"🧭\s*Respuesta\s+ejecutiva\s*(.+?)(?:\n\n[🗓️💸✅🧾❌📚⚖️]|$)", txt, flags=re.IGNORECASE | re.DOTALL)
+        sec = m.group(1) if m else ""
+        fb = re.search(r"^\s*[-•]\s*(.+)$", sec, flags=re.MULTILINE)
+        if not fb:
+            return False
+        bullet = fb.group(1).strip().lower()
+        keywords = ["sí", "si,", "no", "depende", "es legal", "no es legal", "permitido", "prohibido", "puedes", "no puedes"]
+        return any(k in bullet for k in keywords)
+
     tokens_total = 0
 
     # ----------------- (1) PROMPT BUILDER -----------------
@@ -365,16 +375,13 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         br = openai_client.chat.completions.create(**kwargs_b)
         builder_txt = (br.choices[0].message.content or "").strip()
         tokens_total += br.usage.total_tokens if getattr(br, "usage", None) else 0
-        # Intentar parsear JSON
         try:
             bj = json.loads(builder_txt)
         except Exception:
-            # Fallback simple si no vino JSON limpio
             bj = {}
     except Exception:
         bj = {}
 
-    # Defaults robustos si el builder falla
     queries = bj.get("queries_gob_ec") or [
         (question or ""),
         (question or "") + " sitio: gob.ec",
@@ -392,6 +399,13 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     answer_hints = bj.get("answer_hints") or []
     timeline_required = bool(bj.get("timeline_required", False))
 
+    # Heurística adicional (eleva calidad en temas frecuentes sin romper escalabilidad)
+    ql = (question or "").lower()
+    if any(p in ql for p in ["4 dias", "4 días", "4x10", "10 horas", "10h"]):
+        must_rules.append("Para jornada 4×10 o 10 horas/día, evalúa Art. 47.2 (jornada prolongada) además de 47, 50 y 55 CT.")
+        answer_hints.append("Límites: ≤10h/día y ≤40h/sem; acuerdo escrito; publicar/registrar horario; recargos si excedes; descanso 48h.")
+        queries.append((question or "") + " jornada prolongada 47.2 trabajo.gob.ec")
+
     # ----------------- (2) WEB CSE -----------------
     all_results = []
     for q in queries[:6]:
@@ -401,7 +415,6 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     web_context_text = _mk_web_text(web_snippets)
 
     # ----------------- (3) ANSWER WRITER -----------------
-    # Secciones fijas (escala y consistencia). Timeline se maneja dentro de Acciones/Plan.
     required_sections = [
         "🧭 Respuesta ejecutiva",
         "🗓️ Tabla de plazos y responsables",
@@ -417,7 +430,7 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         "Reglas duras:\n"
         "- Usa solo información de WEB_SNIPPETS (dominios gob.ec) para cuerpo, plazos, pasos, multas, checklist.\n"
         "- Si un dato no aparece, escribe “—”. Nunca inventes.\n"
-        "- Cita fuentes al final en 📚 Fuentes consultadas (título + dominio, no repitas dominios idénticos).\n"
+        "- Cita fuentes al final en 📚 Fuentes consultadas (título + dominio, sin repetir dominios idénticos y sin URLs).\n"
         "- Si CONTEXT_DOCS existe, agrega al final ⚖️ Fundamento legal con [CÓDIGO Art. N] + 1–2 citas textuales cortas por artículo y cierra con “Me baso en [artículos citados]”.\n"
         "- Tono profesional, directo, answer-first. Si timeline_required es true, organiza acciones por Día 1… Día 5/7 dentro de “✅ Acciones inmediatas”.\n"
         "Salida: texto con los encabezados EXACTOS siguientes:\n"
@@ -425,7 +438,6 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         + ("\n" + "⚖️ Fundamento legal" if context_docs else "")
     )
 
-    # Compactar context_docs para el escritor (solo para la sección ⚖️)
     docs_compact_lines = []
     for d in (context_docs or [])[:12]:
         cod = (d.get("codigo") or "").strip()
@@ -435,7 +447,6 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
             docs_compact_lines.append(cod + " Art." + art + ": " + txt[:600])
     context_docs_text = "\n".join(docs_compact_lines) if docs_compact_lines else "(sin documentos)"
 
-    # Construir el mensaje de usuario del writer
     sections_text = "\n".join(["- " + s for s in required_sections])
     must_rules_text = "\n".join(["- " + r for r in must_rules])
     hints_text = ("\n".join(["- " + h for h in answer_hints])) if answer_hints else "- —"
@@ -463,18 +474,22 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
 
     wr = openai_client.chat.completions.create(**kwargs_w)
     respuesta = (wr.choices[0].message.content or "").strip()
-    tokens_total += wr.usage.total_tokens if getattr(wr, "usage", None) else 0
+    tokens_total = (tokens_total + wr.usage.total_tokens) if getattr(wr, "usage", None) else tokens_total
 
     # ----------------- (4) Quality Gate -----------------
     missing = _ensure_sections(respuesta, required_sections)
-    if missing:
+    needs_answer_first = not _answer_first_ok(respuesta)
+
+    if missing or needs_answer_first:
         fix_instr = (
             "Corrige para cumplir EXACTAMENTE los encabezados requeridos, sin inventar. "
-            "Usa “—” cuando el dato no conste en las fuentes. Mantén tono answer-first."
+            "Usa “—” cuando el dato no conste en las fuentes. "
+            "La primera viñeta de “🧭 Respuesta ejecutiva” DEBE tomar postura clara (p. ej., “Sí, con condiciones: …” / “No, porque …” / “Depende de …, si … entonces …”)."
         )
         fix_user = (
-            "Faltan secciones: " + ", ".join(missing) +
-            "\n\nRespuesta actual:\n" + respuesta +
+            ("Faltan secciones: " + ", ".join(missing) + "\n") if missing else "" +
+            ("La respuesta no es answer-first en la primera viñeta.\n" if needs_answer_first else "") +
+            "\nRespuesta actual:\n" + respuesta +
             "\n\nPREGUNTA:\n" + (question or "") +
             "\n\nWEB_SNIPPETS (gob.ec):\n" + web_context_text +
             "\n\nSECTIONS requeridos:\n" + sections_text +
@@ -494,7 +509,7 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         fixed = (wr2.choices[0].message.content or "").strip()
         if fixed:
             respuesta = fixed
-            tokens_total += wr2.usage.total_tokens if getattr(wr2, "usage", None) else 0
+            tokens_total = (tokens_total + wr2.usage.total_tokens) if getattr(wr2, "usage", None) else tokens_total
 
     # ----------------- (5) Notas operativas opcionales -----------------
     if contexto_practico:
@@ -507,6 +522,7 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
             respuesta += "\n\n" + bloque
 
     return respuesta, tokens_total
+
 
 
 # ============= RESPUESTA PRÁCTICA =============
