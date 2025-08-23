@@ -443,6 +443,7 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         q + " site:trabajo.gob.ec",
         q + " site:iess.gob.ec",
         q + " site:sri.gob.ec",
+        q + " site:derechosintelectuales.gob.ec",
     ]
     # Heurística temática simple
     ql = q.lower()
