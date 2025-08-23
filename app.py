@@ -220,6 +220,7 @@ Reglas de rigor:
     return respuesta, tokens_usados
 
 # ===============  enpresario ===============
+
 def generate_legal_response_empresario(question, context_docs, contexto_practico=None):
     """
     MISMA FIRMA Y RETORNO:
@@ -508,6 +509,68 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     return respuesta, tokens_total
 
 
+# ============= RESPUESTA PRÁCTICA =============
+
+def obtener_respuesta_practica(question, score=None):
+    practical_index_name = "indice-respuestas-abogados"
+    practical_index = pc.Index(practical_index_name)
+
+    practical_vector_store = PineconeVectorStore(
+        pinecone_index=practical_index
+    )
+
+    practical_index_instance = VectorStoreIndex.from_vector_store(
+        vector_store=practical_vector_store,
+        service_context=service_context
+    )
+
+    engine = practical_index_instance.as_query_engine(similarity_top_k=1)
+    resultado = engine.query(question)
+
+    if not resultado.source_nodes:
+        return None
+
+    texto_practico = resultado.response.strip()
+
+    # Elegir introducción según el score
+    if score is not None and score < 0.75:
+        introduccion = (
+            "❗ La respuesta no responde directamente a la pregunta del usuario.\n"
+            "- Introduce con una frase como:\n"
+            "  \"Es difícil indicarte si [reformula aquí la intención del usuario], en este caso es importante que un abogado experto te asesore. Sin embargo, puedo decirte que...\"\n"
+            "- Reformula después el contenido original como referencia general.\n"
+            "- No afirmes nada que no esté expresamente en el texto original.\n"
+        )
+    else:
+        introduccion = (
+            "✅ La respuesta es clara y útil para la pregunta del usuario:\n"
+            "- Reformúlala sin alterar el mensaje, con un tono claro, amable y profesional.\n"
+        )
+
+    # Prompt final
+    prompt = (
+        "Reformula esta respuesta práctica legal para que suene humana, empática, cercana y útil para alguien sin conocimientos jurídicos. Usa segunda persona. Evalúa si responde o no directamente a la siguiente pregunta:\n\n"
+        f"🧑‍⚖️ Pregunta del usuario: \"{question}\"\n\n"
+        f"{introduccion}\n"
+        "🔒 Reglas adicionales:\n"
+        "- Conserva enlaces web útiles como http://consultas.funcionjudicial.gob.ec si están presentes en el texto original.\n"
+        "- NO agregues enlaces si no están.\n"
+        "- Elimina nombres propios, montos específicos, fechas y datos sensibles.\n\n"
+        f"Texto original:\n{texto_practico}"
+    )
+
+    # Llamada a OpenAI
+    reformulado = openai_client.chat.completions.create(
+        model=CONFIG["OPENAI_MODEL"],
+        messages=[
+            {"role": "system", "content": "Eres un asistente legal empático que habla en tono claro y humano."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.4,
+        max_tokens=800
+    )
+
+    return reformulado.choices[0].message.content.strip()
 
 
 # ============= ENDPOINT PRINCIPAL =============
