@@ -236,6 +236,11 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     4) Quality Gate: verifica secciones planeadas, “answer-first”, tablas si se prometen, y fuentes (si existen).
     5) Agrega ⚖️ Fundamento legal al final (solo con tus context_docs, con citas textuales cortas).
     6) (Opcional) Anexa “🧩 Notas operativas (no normativo)” si se recibe `contexto_practico`.
+
+    NUEVO:
+    - Inserta al final de cada sección (excepto “📚 Fuentes consultadas”) un enlace corto “🔗 <ALIAS>”
+      a la mejor fuente .gob.ec utilizada para esa sección.
+    - Reemplaza el contenido de “📚 Fuentes consultadas” por una lista HTML <ul> con 3–7 enlaces deduplicados por dominio.
     """
     import os, json, re, html
     from urllib.parse import urlparse
@@ -338,7 +343,7 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
         return "⚖️ Fundamento legal\n" + "\n".join(articulos) + "\n\n" + cierre
 
     def _allowed_refs_from_docs(docs):
-        """Lista de referencias válidas 'CÓDIGO Art. N' para validar citas inline."""
+        """Lista de referencias válidas 'CÓDIGO Art. N' para validar citas inline (si lo usas)."""
         refs = []
         for d in docs or []:
             codigo = (d.get("codigo") or "").strip()
@@ -372,6 +377,111 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     def _has_markdown_table(txt):
         """Chequea si hay una tabla Markdown básica en el texto."""
         return bool(re.search(r"^\|.+\|\s*\n\|[-:\s|]+\|\s*\n(\|.*\|\s*\n)+", txt, flags=re.MULTILINE))
+
+    # ---------- NUEVOS helpers para enlaces por sección ----------
+
+    STOP_ES = {"de","la","las","los","un","una","uno","y","o","u","para","por","con","sin","del","al","en","que","como","cuando","donde","cuál","cuáles","segun","ante","entre","hacia","hasta","sobre","tras","este","esta","esto"}
+
+    def _domain_alias(url: str) -> str:
+        """Devuelve alias corto para dominios gob.ec (SRI, IESS, MDT, SENADI…)."""
+        try:
+            d = urlparse(url).netloc.lower().replace("www.", "")
+        except Exception:
+            return "FUENTE"
+        mapping = {
+            "sri.gob.ec": "SRI",
+            "iess.gob.ec": "IESS",
+            "trabajo.gob.ec": "MDT",
+            "ministeriodeltrabajo.gob.ec": "MDT",
+            "derechosintelectuales.gob.ec": "SENADI",
+            "snai.gob.ec": "SNAI",
+            "uafe.gob.ec": "UAFE",
+            "sercop.gob.ec": "SERCOP",
+            "registrocivil.gob.ec": "REGISTRO CIVIL",
+            "funcionjudicial.gob.ec": "FUNCIÓN JUDICIAL",
+            "corteconstitucional.gob.ec": "CORTE CONSTITUCIONAL",
+            "ant.gob.ec": "ANT",
+            "arcotel.gob.ec": "ARCOTEL",
+            "arcsa.gob.ec": "ARCSA",
+            "senescyt.gob.ec": "SENESCYT",
+            "aduana.gob.ec": "SENAE",
+        }
+        if d in mapping:
+            return mapping[d]
+        # Si es .gob.ec: usa subdominio como alias (ej. "midena.gob.ec" -> "MIDENA")
+        return (d.split(".")[0].upper() if d.endswith(".gob.ec") else d.upper())
+
+    def _norm_terms(text: str) -> set:
+        t = re.sub(r"[^a-záéíóúñü0-9 ]+", " ", (text or "").lower())
+        return {w for w in t.split() if len(w) > 2 and w not in STOP_ES}
+
+    def _best_snippet_for(section_text: str, snips: list, min_overlap: int = 2):
+        """Escoge el snippet web más afín a la sección por solapamiento de términos."""
+        st = _norm_terms(section_text)
+        best, score = None, 0
+        for sn in snips or []:
+            mix = " ".join([sn.get("title",""), sn.get("snippet","")])
+            sc = len(st & _norm_terms(mix))
+            if sc > score:
+                best, score = sn, sc
+        return best if score >= min_overlap else None
+
+    def _split_by_sections(respuesta: str, sections: list):
+        """Encuentra offsets de cada sección por el título exacto (línea completa)."""
+        hits = []
+        for s in sections:
+            m = re.search(r"^" + re.escape(s) + r"\s*$", respuesta, flags=re.MULTILINE)
+            if m: hits.append((s, m.start()))
+        hits.sort(key=lambda x: x[1])
+        chunks = []
+        for i, (s, start) in enumerate(hits):
+            end = hits[i+1][1] if i+1 < len(hits) else len(respuesta)
+            chunks.append((s, start, end))
+        return chunks
+
+    def _attach_links_at_section_ends(respuesta: str, sections: list, snips: list) -> str:
+        """Añade '🔗 <alias>' con enlace al final de cada sección (excepto Fuentes)."""
+        chunks = _split_by_sections(respuesta, sections)
+        if not chunks:
+            return respuesta
+        used = set()
+        new_parts, last_end = [], 0
+        for (title, start, end) in chunks:
+            # Copia lo previo sin tocar
+            new_parts.append(respuesta[last_end:start])
+            segment = respuesta[start:end]
+            if title.strip() != "📚 Fuentes consultadas":
+                # Evitar reutilizar el mismo link en muchas secciones
+                remaining = [r for r in (snips or []) if (r.get("link") or "") not in used]
+                cand = _best_snippet_for(segment, remaining)
+                if cand and cand.get("link"):
+                    alias = _domain_alias(cand["link"])
+                    link_html = f'\n\n🔗 <a href="{html.escape(cand["link"])}" target="_blank" rel="noopener nofollow">{html.escape(alias)}</a>'
+                    segment = segment.rstrip() + link_html + "\n"
+                    used.add(cand["link"])
+            new_parts.append(segment)
+            last_end = end
+        new_parts.append(respuesta[last_end:])
+        return "".join(new_parts)
+
+    def _mk_fuentes_html(snips, cap=7):
+        """Lista HTML de fuentes (deduplicadas por dominio)."""
+        if not snips:
+            return "<p>—</p>"
+        used_domains, items = set(), []
+        for r in snips:
+            u = (r.get("link") or "").strip()
+            if not u:
+                continue
+            d = urlparse(u).netloc.replace("www.", "")
+            if d in used_domains:
+                continue
+            t = html.escape(r.get("title") or d)
+            items.append(f'<li><a href="{html.escape(u)}" target="_blank" rel="noopener nofollow">{t}</a> — {html.escape(d)}</li>')
+            used_domains.add(d)
+            if len(items) >= cap:
+                break
+        return "<ul>" + "\n".join(items) + "</ul>"
 
     # ===================== Inicio del flujo =====================
     tokens_total = 0
@@ -414,17 +524,14 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     if not sections:
         sections = ["🧭 Respuesta ejecutiva", "🗓️ Plazos y responsables", "💸 Multas y riesgos", "✅ Acciones inmediatas", "🧾 Checklist", "❌ Errores comunes", "📚 Fuentes consultadas"]
     # Normalizar y recortar 3–10
-    # Asegura que existan primera y última fijas
     if sections[0] != "🧭 Respuesta ejecutiva":
         sections = ["🧭 Respuesta ejecutiva"] + [s for s in sections if s != "🧭 Respuesta ejecutiva"]
     if "📚 Fuentes consultadas" not in sections:
         sections.append("📚 Fuentes consultadas")
-    # Limitar a 3–10 conservando primera/última
     if len(sections) < 3:
         sections = sections + ["✅ Acciones inmediatas"]
     sections = sections[:10]
     if sections[-1] != "📚 Fuentes consultadas":
-        # fuerza la última
         sections = [s for s in sections if s != "📚 Fuentes consultadas"]
         sections.append("📚 Fuentes consultadas")
 
@@ -432,9 +539,8 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     wants_table = any(any(k in s.lower() for k in ["plazo", "tabla", "responsable"]) for s in sections)
 
     # ---------- B) FUENTES: LEGAL_FACTS + WEB (gob.ec) ----------
-    # LEGAL_FACTS (de tus context_docs)
     legal_facts_text = _compact_legal_text(context_docs)
-    allowed_refs = _allowed_refs_from_docs(context_docs)
+    allowed_refs = _allowed_refs_from_docs(context_docs)  # (por si validas las citas inline)
 
     # WEB: Queries base (planner no retorna queries; usamos heurística + pregunta)
     queries = [
@@ -461,13 +567,13 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     web_context_text = _mk_web_text(web_snippets)
 
     # ---------- C) ANSWER WRITER ----------
-    # Instrucciones para el escritor (usa LEGAL -> WEB -> fallback LLM)
     writer_system = (
         "Eres un abogado corporativo ecuatoriano para gerentes. "
         "Responde ‘answer-first’ y llena TODAS las secciones listadas por el plan. "
         "Prioridad de información: 1) LEGAL_FACTS (tus artículos). 2) WEB_SNIPPETS (gob.ec). 3) Conocimiento propio si no hay fuentes. "
         "Si aplicas una regla de LEGAL_FACTS, cierra la oración con [CÓDIGO Art. N]. "
         "Si falta un dato, usa “—” en vez de inventar. "
+        "No coloques enlaces en el cuerpo; las referencias web se añadirán automáticamente al final de cada sección. "
         "En '📚 Fuentes consultadas', lista 3–7 títulos + dominio (sin repetir dominios). "
         "Si no hay ninguna fuente web válida, igualmente escribe la respuesta basada en conocimiento general y coloca '—' en Fuentes."
     )
@@ -542,11 +648,24 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
             respuesta = fixed
             tokens_total += wr2.usage.total_tokens if getattr(wr2, "usage", None) else 0
 
-    # ---------- E) Notas operativas (opcional) ----------
+    # ---------- E) Enlaces por sección + Fuentes HTML ----------
+    # Inserta "🔗 <ALIAS>" al final de cada sección (excepto la de fuentes)
+    respuesta = _attach_links_at_section_ends(respuesta, sections, web_snippets)
+
+    # Reemplaza el contenido de “📚 Fuentes consultadas” con lista HTML
+    fuentes_html = _mk_fuentes_html(web_snippets, cap=7)
+    new_respuesta = re.sub(r"(📚\s*Fuentes consultadas\s*)[\s\S]*$", r"\1\n" + fuentes_html, respuesta)
+    if new_respuesta == respuesta:
+        # Por si acaso no encontró la sección (no debería pasar), la agregamos al final
+        respuesta = respuesta.rstrip() + "\n\n📚 Fuentes consultadas\n" + fuentes_html
+    else:
+        respuesta = new_respuesta
+
+    # ---------- F) Notas operativas (opcional) ----------
     if contexto_practico:
         respuesta += "\n\n🧩 Notas operativas (no normativo)\n" + (contexto_practico.strip()[:1200])
 
-    # ---------- F) Fundamento legal (tus context_docs) ----------
+    # ---------- G) Fundamento legal (tus context_docs) ----------
     if context_docs:
         bloque = _mk_fundamento(context_docs)
         if bloque:
@@ -556,6 +675,7 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
             respuesta += "\n\n" + bloque
 
     return respuesta, tokens_total
+
 
 
 
