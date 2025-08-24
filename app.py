@@ -1423,15 +1423,11 @@ def responses_toolcheck():
     try:
         from openai import OpenAI
 
-        # Usa el cliente global si existe; si no, crea uno nuevo con la API key
-        client = globals().get("openai_client")
-        if client is None:
-            client = OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
+        # Cliente OpenAI (usa el global si existe)
+        client = globals().get("openai_client") or OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
 
-        # Forzar un modelo GPT-5 por si en la config quedó otro
-        model = CONFIG.get("OPENAI_MODEL_RESPONSES") or CONFIG.get("OPENAI_MODEL") or "gpt-5.1"
-        if not str(model).startswith("gpt-5"):
-            model = "gpt-5.1"
+        # Forzar gpt-5-mini para esta prueba (o respeta OPENAI_MODEL_RESPONSES si lo definiste)
+        model = CONFIG.get("OPENAI_MODEL_RESPONSES") or "gpt-5-mini"
 
         def _call(tool_type: str):
             return client.responses.create(
@@ -1446,7 +1442,7 @@ def responses_toolcheck():
             r = _call("web_search")
             tool_used = "web_search"
         except Exception as e1:
-            # 2) Fallback a web_search_preview si el tenant no tiene web_search
+            # 2) Fallback a web_search_preview
             try:
                 r = _call("web_search_preview")
                 tool_used = "web_search_preview"
@@ -1464,6 +1460,7 @@ def responses_toolcheck():
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 if __name__ == "__main__":
