@@ -688,14 +688,18 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
     (Responses API + Web Search). No fija dominios; el modelo escoge fuentes.
     Conserva tu bloque final de ⚖️ Fundamento legal con context_docs.
     """
-    import re, html
+    import re, html, logging
     from urllib.parse import urlparse
 
-    # -------- Config --------
+    # -------- Config (FORZAR GPT-5) --------
     CONFIG = globals().get("CONFIG", {}) if "CONFIG" in globals() else {}
-    model = CONFIG.get("OPENAI_MODEL_RESPONSES", CONFIG.get("OPENAI_MODEL", "gpt-5.1"))
+    model = CONFIG.get("OPENAI_MODEL_RESPONSES") or CONFIG.get("OPENAI_MODEL") or "gpt-5.1"
+    # Si no es GPT-5, lo forzamos explícitamente
+    if not str(model).startswith("gpt-5"):
+        model = "gpt-5.1"
     max_out = int(CONFIG.get("MAX_TOKENS", 1800))
     temperature = float(CONFIG.get("TEMPERATURE", 0.3))
+    logging.getLogger().warning(f"[Empresario_API] Using Responses model: {model}")
 
     # -------- Cliente (Responses API) --------
     try:
@@ -750,7 +754,7 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
                 d = urlparse(u).netloc.replace("www.","")
             except Exception:
                 d = ""
-            if d in used_domains: 
+            if d in used_domains:
                 continue
             t = html.escape(titles.get(u, d or "Fuente"))
             items.append(f'<li><a href="{html.escape(u)}" target="_blank" rel="noopener nofollow">{t}</a> — {html.escape(d or "")}</li>')
@@ -762,13 +766,10 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
         """Extrae URLs y títulos desde la salida estructurada del Responses API (robusto a variantes).
         Si no hay metadatos, hace regex sobre el texto."""
         urls, titles = [], {}
-        # 1) Intentar en r.output (donde suelen venir eventos de web_search)
         for item in (getattr(resp, "output", []) or []):
             try:
-                # item puede ser dict o objeto; buscamos campos comunes
                 meta = {}
                 if isinstance(item, dict):
-                    # distintos nombres posibles
                     meta = (item.get("citation") or item.get("metadata") or item.get("source") or {})
                 else:
                     meta = getattr(item, "citation", None) or getattr(item, "metadata", None) or {}
@@ -779,7 +780,6 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
                     if ttl: titles[url] = ttl
             except Exception:
                 pass
-        # 2) Si sigue vacío, extraer por regex del texto
         text = (getattr(resp, "output_text", "") or "")
         if not urls and text:
             for m in re.findall(r"https?://[^\s\)\]\}<>\"']+", text):
@@ -794,10 +794,10 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
     SYSTEM = (
         "Eres un abogado corporativo ecuatoriano para gerentes. "
         "Puedes usar la herramienta Web Search cuando aporte valor. "
-        "No inventes montos ni plazos; si no hay dato cierto, usa “—”. "
-        "Estructura ENTRE 3 y 10 secciones: la primera '🧭 Respuesta ejecutiva' y la última '📚 Fuentes consultadas'. "
-        "En '📚 Fuentes consultadas' entrega una lista HTML <ul> con 3–7 enlaces (título + dominio), sin repetir dominio. "
-        "Si aplicas reglas de LEGAL_FACTS, cierra la oración con [CÓDIGO Art. N]."
+        "Responde 'answer-first'. No inventes montos ni plazos; si el dato no está claro, usa “—”. "
+        "Estructura ENTRE 3 y 10 secciones: la primera debe ser '🧭 Respuesta ejecutiva' y la última '📚 Fuentes consultadas'. "
+        "En '📚 Fuentes consultadas' entrega una lista HTML <ul> de 3–7 enlaces (título + dominio), sin repetir dominios. "
+        "Si aplicas reglas de LEGAL_FACTS, cierra esa oración con [CÓDIGO Art. N]."
     )
 
     USER = (
@@ -818,16 +818,26 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
             max_output_tokens=max_out,
             temperature=temperature,
         )
-    except Exception:
-        # algunos tenants usan 'web_search_preview'
-        r = client.responses.create(
-            model=model,
-            input=[{"role":"system","content":SYSTEM},
-                   {"role":"user","content":USER}],
-            tools=[{"type":"web_search_preview"}],
-            max_output_tokens=max_out,
-            temperature=temperature,
-        )
+    except Exception as e:
+        msg = str(e).lower()
+        # Intento alterno si el tenant expone 'web_search_preview'
+        try:
+            r = client.responses.create(
+                model=model,
+                input=[{"role":"system","content":SYSTEM},
+                       {"role":"user","content":USER}],
+                tools=[{"type":"web_search_preview"}],
+                max_output_tokens=max_out,
+                temperature=temperature,
+            )
+        except Exception as e2:
+            msg += " | " + str(e2).lower()
+            # Si la búsqueda web no está soportada/habilitada → fallback a tu pipeline clásico
+            if any(k in msg for k in ["not supported", "not enabled", "unknown tool"]):
+                logging.getLogger().warning("[Empresario_API] Web Search no disponible; usando pipeline CSE.")
+                return generate_legal_response_empresario(question, context_docs, contexto_practico)
+            else:
+                raise
 
     # Texto generado por el modelo (ya con su elección de páginas)
     respuesta = getattr(r, "output_text", "") or ""
@@ -849,12 +859,12 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
     if context_docs:
         bloque = _mk_fundamento(context_docs)
         if bloque:
-            # si el modelo puso uno distinto, lo reemplazamos por el nuestro
             if "⚖️ Fundamento legal" in respuesta:
                 respuesta = re.split(r"\n?⚖️ Fundamento legal.*", respuesta, maxsplit=1)[0].rstrip()
             respuesta += "\n\n" + bloque
 
     return respuesta, tokens_total
+
 
 
 # ============= RESPUESTA PRÁCTICA =============
