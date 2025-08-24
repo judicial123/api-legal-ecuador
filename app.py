@@ -682,19 +682,19 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
     """
     Versión playground-like:
     - No usa context_docs ni añade ⚖️ Fundamento legal.
-    - Delegado a Responses API + Web Search (modelo GPT-5).
+    - Delegado a Responses API + Web Search (GPT-5 mini).
     - Estructura práctica y enlaces como en Playground.
     """
     import re, html, logging
     from urllib.parse import urlparse
 
-    # -------- Config (FORZAR GPT-5) --------
+    # -------- Config (FORZAR GPT-5 mini) --------
     CONFIG = globals().get("CONFIG", {}) if "CONFIG" in globals() else {}
-    model = CONFIG.get("OPENAI_MODEL_RESPONSES") or CONFIG.get("OPENAI_MODEL") or "gpt-5.1"
+    model = CONFIG.get("OPENAI_MODEL_RESPONSES") or CONFIG.get("OPENAI_MODEL") or "gpt-5-mini"
     if not str(model).startswith("gpt-5"):
-        model = "gpt-5.1"
+        model = "gpt-5-mini"
     max_out = int(CONFIG.get("MAX_TOKENS", 3000))
-    temperature = 0.5
+    temperature = 0.3
     logging.getLogger().warning(f"[Empresario_API|Playground] Using Responses model: {model}")
 
     # -------- Cliente (Responses API) --------
@@ -711,7 +711,7 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
         titles = titles or {}
         used_domains, items = set(), []
         for u in urls:
-            if not u: 
+            if not u:
                 continue
             try:
                 d = urlparse(u).netloc.replace("www.","")
@@ -722,7 +722,7 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
             t = html.escape(titles.get(u, d or "Fuente"))
             items.append(f'<li><a href="{html.escape(u)}" target="_blank" rel="noopener nofollow">{t}</a> — {html.escape(d or "")}</li>')
             used_domains.add(d)
-            if len(items) >= cap: 
+            if len(items) >= cap:
                 break
         return "<ul>" + "\n".join(items) + "</ul>" if items else "<p>—</p>"
 
@@ -740,7 +740,7 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
                 ttl = (meta.get("title") or meta.get("source_title") or "").strip()
                 if url and url not in urls:
                     urls.append(url)
-                    if ttl: 
+                    if ttl:
                         titles[url] = ttl
             except Exception:
                 pass
@@ -756,12 +756,19 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
 
     SYSTEM = (
         "Eres un asesor experto en trámites empresariales en Ecuador (es-EC, tz: America/Guayaquil). "
-        "Usa la herramienta Web Search de forma ACTIVA: realiza al menos 4 búsquedas, abre y lee varias fuentes y contrasta. "
-        "PRIORIZA sitios oficiales (supercias.gob.ec, sri.gob.ec, gob.ec, funcionjudicial.gob.ec, registros mercantiles); "
-        "puedes usar fuentes reputadas como apoyo sólo si aportan. "
-        "Responde answer-first y evita generalidades. Si das montos/plazos, deben salir de una fuente; si no hay dato cierto, usa '—' y explica cómo obtenerlo. "
-        "Estructura ENTRE 3 y 8 secciones útiles para un empresario. La primera sección debe ser '🧭 Respuesta ejecutiva' "
-        "y la última '📚 Fuentes consultadas'. En '📚 Fuentes consultadas' entrega un <ul> con 5–7 enlaces (título + dominio) sin repetir dominio."
+        "Usa la herramienta Web Search de forma ACTIVA (varias búsquedas y contraste) priorizando dominios oficiales "
+        "(supercias.gob.ec, sri.gob.ec, gob.ec, funcionjudicial.gob.ec, registros mercantiles). "
+        "Responde answer-first y NO inventes montos/plazos: si no están claros, escribe “—” y explica cómo obtenerlos. "
+        "FORMATO EXACTO (máx 8 secciones):\n"
+        "1) 🧭 Respuesta ejecutiva (bullets cortos con veredicto claro: Sí/No/Depende…)\n"
+        "2) Pasos oficiales\n"
+        "3) Documentos mínimos\n"
+        "4) Costos y tasas (si hay)\n"
+        "5) Plazos típicos (si hay)\n"
+        "6) ✅ Acciones inmediatas / ❌ Errores comunes (opcional)\n"
+        "7) 🧩 Tips operativos (opcional)\n"
+        "8) 📚 Fuentes consultadas (obligatorio) como <ul> 5–7 enlaces (título + dominio), sin repetir dominio.\n"
+        "Nunca dejes la respuesta sin texto final; si aún estás buscando, escribe una síntesis útil igualmente."
     )
 
     USER = (
@@ -772,7 +779,7 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
     tools = [{"type": "web_search"}]
     tokens_total = 0
 
-    # -------- Llamada principal --------
+    # -------- Llamada principal (con web_search) --------
     try:
         r = client.responses.create(
             model=model,
@@ -783,8 +790,7 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
             temperature=temperature,
         )
     except Exception as e:
-        msg = str(e).lower()
-        # Intento alterno si tu tenant expone 'web_search_preview'
+        # Fallback a web_search_preview si existe en el tenant
         try:
             r = client.responses.create(
                 model=model,
@@ -795,8 +801,6 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
                 temperature=temperature,
             )
         except Exception as e2:
-            msg += " | " + str(e2).lower()
-            # Sin web search disponible → lo indicamos explícitamente
             aviso = "ℹ️ Nota: tu cuenta no tiene habilitado Web Search en Responses API; el resultado puede diferir del Playground."
             return (aviso, 0)
 
@@ -808,13 +812,39 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
     except Exception:
         tokens_total = 0
 
+    # -------- Si no devolvió texto, reintento sin herramientas (síntesis mínima) --------
+    if not respuesta.strip():
+        r2 = client.responses.create(
+            model=model,
+            input=[
+                {"role":"system","content":"Responde en el formato pedido, AUN SIN BUSCAR, usando “—” donde falten datos, y SIEMPRE incluye '📚 Fuentes consultadas' con una lista vacía si no tienes enlaces."},
+                {"role":"user","content":USER}
+            ],
+            max_output_tokens=min(max_out, 800),
+            temperature=0.2,
+        )
+        respuesta = getattr(r2, "output_text", "") or ""
+        try:
+            u2 = getattr(r2, "usage", None)
+            tokens_total += (getattr(u2, "input_tokens", 0) or 0) + (getattr(u2, "output_tokens", 0) or 0)
+        except Exception:
+            pass
+
     # -------- Forzar sección de Fuentes si falta --------
     if "📚 Fuentes consultadas" not in respuesta:
         urls, titles = _extract_citations(r)
         fuentes_html = _mk_fuentes_html_from_urls(urls, titles, cap=7)
         respuesta = respuesta.rstrip() + "\n\n📚 Fuentes consultadas\n" + fuentes_html
+    else:
+        # Si existe la sección pero sin <ul>, la completamos con las citas detectadas
+        if "<ul>" not in respuesta:
+            urls, titles = _extract_citations(r)
+            fuentes_html = _mk_fuentes_html_from_urls(urls, titles, cap=7)
+            # Reemplaza el bloque de fuentes por nuestra lista HTML
+            respuesta = re.sub(r"(📚\s*Fuentes consultadas\s*)[\s\S]*$", r"\1\n" + fuentes_html, respuesta)
 
     return respuesta, tokens_total
+
 
 
 
