@@ -1450,46 +1450,99 @@ def gpt5_test():
 
 @app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
+    """
+    Verifica:
+      - Que Responses API responda (sin herramientas)
+      - Si 'web_search' está habilitado; si no, prueba 'web_search_preview'
+    Devuelve flags y errores detallados, sin lanzar 500.
+    """
+    from openai import OpenAI
+
+    result = {
+        "ok": False,  # se pone True si al menos Responses API funciona
+        "model_requested": CONFIG.get("OPENAI_MODEL_RESPONSES") or CONFIG.get("OPENAI_MODEL") or "gpt-5-mini",
+        "model_used": None,
+        "responses_api_ok": False,
+        "web_search_available": False,
+        "web_search_tool_used": None,   # "web_search" | "web_search_preview" | None
+        "baseline_output": "",
+        "baseline_input_tokens": None,
+        "baseline_output_tokens": None,
+        "output": "",
+        "input_tokens": None,
+        "output_tokens": None,
+        "errors": {}  # {"baseline": "...", "web_search": "...", "web_search_preview": "..."}
+    }
+
     try:
-        from openai import OpenAI
+        # Cliente (usa global si existe)
+        client = globals().get("openai_client")
+        if client is None or not hasattr(client, "responses"):
+            client = OpenAI(api_key=CONFIG.get("OPENAI_API_KEY"))
 
-        # Cliente OpenAI (usa el global si existe)
-        client = globals().get("openai_client") or OpenAI(api_key=CONFIG["OPENAI_API_KEY"])
+        model = result["model_requested"]
 
-        # Forzar gpt-5-mini para esta prueba (o respeta OPENAI_MODEL_RESPONSES si lo definiste)
-        model = CONFIG.get("OPENAI_MODEL_RESPONSES") or "gpt-5-mini"
-
-        def _call(tool_type: str):
-            return client.responses.create(
-                model=model,
-                input=[{"role": "user", "content": "di 'ok'"}],
-                tools=[{"type": tool_type}],
-                max_output_tokens=20,
-            )
-
-        # 1) Intento con web_search
+        # 1) Sanity check: Responses API SIN herramientas
         try:
-            r = _call("web_search")
-            tool_used = "web_search"
-        except Exception as e1:
-            # 2) Fallback a web_search_preview
-            try:
-                r = _call("web_search_preview")
-                tool_used = "web_search_preview"
-            except Exception as e2:
-                return jsonify({"ok": False, "error": f"{e1} | {e2}"}), 500
+            r0 = client.responses.create(
+                model=model,
+                input=[{"role": "user", "content": "di 'ok' en una palabra"}],
+                max_output_tokens=8,
+            )
+            result["responses_api_ok"] = True
+            result["ok"] = True
+            result["model_used"] = getattr(r0, "model", model)
+            result["baseline_output"] = getattr(r0, "output_text", "")
+            u0 = getattr(r0, "usage", None)
+            if u0:
+                result["baseline_input_tokens"] = getattr(u0, "input_tokens", None)
+                result["baseline_output_tokens"] = getattr(u0, "output_tokens", None)
+        except Exception as e0:
+            result["errors"]["baseline"] = str(e0)
 
-        usage = getattr(r, "usage", None)
-        return jsonify({
-            "ok": True,
-            "model": getattr(r, "model", model),
-            "tool_used": tool_used,
-            "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
-            "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
-            "output": getattr(r, "output_text", ""),
-        })
+        # 2) Probar web_search (solo si Responses API funciona)
+        if result["responses_api_ok"]:
+            # 2.a) Intento con web_search
+            try:
+                r1 = client.responses.create(
+                    model=model,
+                    input=[{"role": "user", "content": "di 'ok'"}],
+                    tools=[{"type": "web_search"}],
+                    max_output_tokens=20,
+                )
+                result["web_search_available"] = True
+                result["web_search_tool_used"] = "web_search"
+                result["output"] = getattr(r1, "output_text", "")
+                u1 = getattr(r1, "usage", None)
+                if u1:
+                    result["input_tokens"] = getattr(u1, "input_tokens", None)
+                    result["output_tokens"] = getattr(u1, "output_tokens", None)
+            except Exception as e1:
+                result["errors"]["web_search"] = str(e1)
+                # 2.b) Fallback a web_search_preview
+                try:
+                    r2 = client.responses.create(
+                        model=model,
+                        input=[{"role": "user", "content": "di 'ok'"}],
+                        tools=[{"type": "web_search_preview"}],
+                        max_output_tokens=20,
+                    )
+                    result["web_search_available"] = True
+                    result["web_search_tool_used"] = "web_search_preview"
+                    result["output"] = getattr(r2, "output_text", "")
+                    u2 = getattr(r2, "usage", None)
+                    if u2:
+                        result["input_tokens"] = getattr(u2, "input_tokens", None)
+                        result["output_tokens"] = getattr(u2, "output_tokens", None)
+                except Exception as e2:
+                    result["errors"]["web_search_preview"] = str(e2)
+
+        return jsonify(result)
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        # Error inesperado a nivel de endpoint (no por las pruebas)
+        result["errors"]["endpoint"] = str(e)
+        return jsonify(result), 200
+
 
 
 
