@@ -1424,47 +1424,25 @@ import time
 
 import time
 
-@app.route("/gpt5/test2", methods=["GET"])
-def gpt5_test():
-    try:
-        prompt = request.args.get("q", "Di 'pong' y el nombre exacto del modelo que estás usando.")
-        t0 = time.time()
-        resp = openai_client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=[
-                {"role": "system", "content": "Eres un probador mínimo. Responde en una sola línea."},
-                {"role": "user", "content": prompt}
-            ],
-            # GPT-5: NO usar temperature; usa el default del modelo
-            max_completion_tokens=50  # reemplaza max_tokens por max_completion_tokens
-        )
-        latency_ms = int((time.time() - t0) * 1000)
-        content = resp.choices[0].message.content.strip()
-        model_used = getattr(resp, "model", "gpt-5-mini")
-        tokens = resp.usage.total_tokens if getattr(resp, "usage", None) else None
-
-        return jsonify({"ok": True, "model": model_used, "latency_ms": latency_ms,
-                        "total_tokens": tokens, "sample": content})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
-
-@app.route("/responses/toolcheck2", methods=["GET"])
+@app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
     """
-    Diagnóstico de Web Search con Responses API (gpt-5-mini):
-      - Intenta STREAM (para ver eventos de herramienta). Si falla o no completa, reporta el error y los eventos capturados.
-      - Luego intenta NON-STREAM (create normal) para ver si la llamada básica funciona.
+    Verifica Web Search en Responses API (gpt-5-mini) SIN streaming.
+    Hace 2 llamadas:
+      A) baseline (sin tools) -> debe devolver texto ("ok")
+      B) con tools=[web_search] -> pide que pegue el dominio del SRI y termine con 'ok'
     Devuelve:
       - ok, model_used, project_used
-      - web_search_enabled (si la API aceptó 'tools')
-      - web_search_used_in_call (heurística a partir de eventos o output)
-      - eventos/errores detallados (request_id, status_code, body)
+      - baseline_ok, toolcall_ok, web_search_used_in_output (heurística)
+      - usage, request_payloads, y detalles de error (status_code, request_id, body)
+      - sample de output_items (para diagnosticar casos donde solo llega 'reasoning')
+    Requiere: OPENAI_API_KEY; usa project_id quemado si no hay OPENAI_PROJECT.
     """
-    import os, traceback
+    import os, re, traceback
     from flask import jsonify
     from openai import OpenAI
 
-    PROJECT_FALLBACK = "proj_wwBIeNNC2RvV0PTfWohgF7tR"  # <-- tu project ID
+    PROJECT_FALLBACK = "proj_wwBIeNNC2RvV0PTfWohgF7tR"  # <-- tu project_id
     MODEL = "gpt-5-mini"
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -1472,65 +1450,9 @@ def responses_toolcheck():
     if not api_key:
         return jsonify({"ok": False, "error": "Falta OPENAI_API_KEY en env."}), 200
 
-    system_msg = (
-        "Usa EXACTAMENTE una vez la herramienta web_search para ubicar el dominio oficial "
-        "del SRI (Ecuador). Después escribe solamente: ok"
-    )
-    user_msg = "Confirma el uso de web_search y responde 'ok' al final."
-
     client = OpenAI(api_key=api_key, project=project_id)
 
-    # -------- 1) Intento con STREAM para ver eventos de herramienta --------
-    stream_events = []
-    stream_web_used = False
-    stream_error = None
-    final_stream_output = ""
-    final_stream_usage = {}
-
-    try:
-        with client.responses.stream(
-            model=MODEL,
-            input=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            tools=[{"type": "web_search"}],
-            max_output_tokens=128
-        ) as stream:
-            for ev in stream:
-                # Guardamos tipo y hasta 800 chars del evento
-                ev_type = getattr(ev, "event", None) or type(ev).__name__
-                ev_str = str(ev)
-                stream_events.append({"type": ev_type, "sample": ev_str[:800]})
-                low = ev_str.lower()
-                # Heurística amplia para detectar uso de herramienta
-                if ("web_search" in low) or ("tool" in low and "search" in low):
-                    stream_web_used = True
-
-            # Si el stream completó correctamente
-            final = stream.get_final_response()
-            final_stream_output = getattr(final, "output_text", "") or ""
-            usage = getattr(final, "usage", None)
-            if usage:
-                final_stream_usage = {
-                    "input_tokens": getattr(usage, "input_tokens", None),
-                    "output_tokens": getattr(usage, "output_tokens", None),
-                }
-
-            return jsonify({
-                "ok": True,
-                "mode": "stream",
-                "model_used": getattr(final, "model", MODEL),
-                "project_used": project_id,
-                "web_search_enabled": True,              # tools aceptadas
-                "web_search_used_in_call": stream_web_used,
-                "output": final_stream_output,
-                "usage": final_stream_usage,
-                "events": stream_events[:20],            # muestra primeros 20 eventos
-            }), 200
-
-    except Exception as e:
-        # Capturamos error de streaming con detalle total
+    def _safe_err(e):
         err = {
             "message": str(e),
             "type": getattr(e, "type", None),
@@ -1550,96 +1472,120 @@ def responses_toolcheck():
                 "request_id": headers.get("x-request-id") or headers.get("x-openai-request-id"),
                 "body": body
             })
-        stream_error = err  # guardamos para responderlo si también falla el non-stream
+        return err
 
-    # -------- 2) Fallback NON-STREAM: create normal (muestra error si falla) --------
-    try:
-        r = client.responses.create(
-            model=MODEL,
-            input=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            tools=[{"type": "web_search"}],
-            max_output_tokens=128
-        )
-        usage = getattr(r, "usage", None)
-        output_text = getattr(r, "output_text", "") or ""
-        web_used = False
-
-        # Heurística en output para detectar urls/citas
-        raw_output = getattr(r, "output", None)
-        output_items_sample = []
+    def _items_types(obj):
+        out = []
         try:
-            for item in (raw_output or []):
-                s = str(item)
-                output_items_sample.append(s[:400])
-                low = s.lower()
-                if ("web_search" in low) or ("http://" in low) or ("https://" in low):
-                    web_used = True
+            for it in (getattr(obj, "output", []) or []):
+                try:
+                    t = getattr(it, "type", None) or it.__class__.__name__
+                    out.append(t)
+                except Exception:
+                    out.append(str(type(it)))
+        except Exception:
+            pass
+        return out[:20]
+
+    # -------- A) Baseline sin herramientas --------
+    baseline_req = {
+        "model": MODEL,
+        "input": [{"role": "user", "content": "di 'ok' y nada más"}],
+        "max_output_tokens": 64
+    }
+    baseline = {
+        "ok": False, "output": "", "usage": None, "error": None,
+        "items_types": [], "output_items_sample": []
+    }
+    try:
+        r0 = client.responses.create(**baseline_req)
+        usage0 = getattr(r0, "usage", None)
+        baseline["ok"] = True
+        baseline["output"] = getattr(r0, "output_text", "") or ""
+        baseline["usage"] = {
+            "input_tokens": getattr(usage0, "input_tokens", None) if usage0 else None,
+            "output_tokens": getattr(usage0, "output_tokens", None) if usage0 else None,
+        }
+        # diagnosticar tipos de items que vinieron
+        baseline["items_types"] = _items_types(r0)
+        try:
+            for it in (getattr(r0, "output", []) or []):
+                baseline["output_items_sample"].append((getattr(it, "type", None) or it.__class__.__name__, str(it)[:400]))
+        except Exception:
+            pass
+    except Exception as e:
+        baseline["error"] = _safe_err(e)
+
+    # -------- B) Con web_search (sin stream) --------
+    # Pedimos explícitamente que pegue el dominio encontrado y termine con "ok"
+    sys_b = ("Haz UNA sola búsqueda con web_search para encontrar el dominio oficial del SRI en Ecuador. "
+             "Luego responde en DOS líneas: 1) pega SOLO el dominio, 2) escribe: ok")
+    user_b = "Encuentra el dominio oficial del SRI (Ecuador) y sigue el formato indicado."
+
+    tool_req = {
+        "model": MODEL,
+        "input": [
+            {"role": "system", "content": sys_b},
+            {"role": "user", "content": user_b},
+        ],
+        "tools": [{"type": "web_search"}],
+        "max_output_tokens": 128
+    }
+    tool = {
+        "ok": False, "output": "", "usage": None, "error": None,
+        "items_types": [], "output_items_sample": [], "web_search_used_in_output": False
+    }
+    try:
+        r1 = client.responses.create(**tool_req)
+        usage1 = getattr(r1, "usage", None)
+        tool["ok"] = True
+        tool["output"] = getattr(r1, "output_text", "") or ""
+        tool["usage"] = {
+            "input_tokens": getattr(usage1, "input_tokens", None) if usage1 else None,
+            "output_tokens": getattr(usage1, "output_tokens", None) if usage1 else None,
+        }
+        tool["items_types"] = _items_types(r1)
+        try:
+            for it in (getattr(r1, "output", []) or []):
+                tool["output_items_sample"].append((getattr(it, "type", None) or it.__class__.__name__, str(it)[:400]))
         except Exception:
             pass
 
-        return jsonify({
-            "ok": True,
-            "mode": "non-stream",
-            "model_used": getattr(r, "model", MODEL),
-            "project_used": project_id,
-            "web_search_enabled": True,
-            "web_search_used_in_call": web_used,
-            "output": output_text,
-            "output_items_sample": output_items_sample[:10],
-            "usage": {
-                "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
-                "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
-            },
-            "stream_error_before": stream_error,   # útil para depurar por qué falló el stream
-        }), 200
+        # Heurística: considerar que usó la búsqueda si en el texto aparece un dominio/URL plausible del SRI
+        txt = (tool["output"] or "").lower()
+        # Permitimos que ponga dominio o URL
+        if any(pat in txt for pat in ["sri.gob.ec", "http://sri.gob.ec", "https://sri.gob.ec"]):
+            tool["web_search_used_in_output"] = True
+        # segunda heurística: si el modelo imprimió cualquier URL o dominio, marcamos True (débil)
+        if not tool["web_search_used_in_output"]:
+            if re.search(r"(https?://|www\.)[a-z0-9\-\.]+\.[a-z]{2,}", txt):
+                tool["web_search_used_in_output"] = True
 
-    except Exception as e2:
-        # Error del create normal: lo devolvemos con máximo detalle + lo que pasó en stream
-        err2 = {
-            "message": str(e2),
-            "type": getattr(e2, "type", None),
-            "code": getattr(e2, "code", None),
-            "param": getattr(e2, "param", None),
-            "traceback_tail": traceback.format_exc().splitlines()[-6:]
-        }
-        resp2 = getattr(e2, "response", None)
-        if resp2 is not None:
-            try:
-                body2 = resp2.json()
-            except Exception:
-                body2 = getattr(resp2, "text", None)
-            headers2 = getattr(resp2, "headers", {}) or {}
-            err2.update({
-                "status_code": getattr(resp2, "status_code", None),
-                "request_id": headers2.get("x-request-id") or headers2.get("x-openai-request-id"),
-                "body": body2
-            })
+    except Exception as e:
+        tool["error"] = _safe_err(e)
 
-        request_payload = {
-            "model": MODEL,
-            "project": project_id,
-            "tools": [{"type": "web_search"}],
-            "max_output_tokens": 128,
-            "input": [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-        }
+    return jsonify({
+        "ok": baseline["ok"] and tool["ok"],
+        "model_used": MODEL,
+        "project_used": project_id,
 
-        return jsonify({
-            "ok": False,
-            "model_requested": MODEL,
-            "project_used": project_id,
-            "web_search_enabled": True,            # intentamos usar la herramienta
-            "web_search_used_in_call": False,
-            "error_stream": stream_error,          # qué pasó en stream
-            "error_non_stream": err2,              # qué pasó en non-stream
-            "events_stream_captured": stream_events[:20],
-            "request_payload": request_payload,
-        }), 200
+        "baseline_ok": baseline["ok"],
+        "baseline_output": baseline["output"],
+        "baseline_items_types": baseline["items_types"],
+        "baseline_usage": baseline["usage"],
+        "baseline_error": baseline["error"],
+        "baseline_request_payload": baseline_req,
+
+        "toolcall_ok": tool["ok"],
+        "toolcall_output": tool["output"],
+        "toolcall_items_types": tool["items_types"],
+        "toolcall_usage": tool["usage"],
+        "toolcall_error": tool["error"],
+        "toolcall_request_payload": tool_req,
+
+        # Heurística de uso real (si el texto contiene dominio/URL)
+        "web_search_used_in_output": tool["web_search_used_in_output"],
+    }), 200
 
 
 
