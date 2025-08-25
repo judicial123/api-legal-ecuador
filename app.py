@@ -1448,91 +1448,122 @@ def gpt5_test():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
-@app.route("/responses/toolcheck1", methods=["GET"])
+@app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
     """
-    Verifica si Web Search está habilitado para Responses API con gpt-5-mini.
-    - Paso 1 (ping): intenta una llamada con tools=[{"type": "web_search"}] para confirmar que el endpoint acepta la herramienta.
-    - Paso 2 (uso): instruye a hacer UNA búsqueda y luego responder 'ok'; intenta detectar si hubo señales de uso de la herramienta.
+    Check único:
+      - Modelo: gpt-5-mini
+      - Herramienta: web_search (forzada)
+    Devuelve si la llamada realmente usó web_search y, si falla,
+    muestra un payload de error detallado para depurar.
     """
     from openai import OpenAI
     from flask import jsonify
+    import os, traceback
+
+    def _used_web_search(resp):
+        used, why = False, []
+        out = getattr(resp, "output", []) or []
+        for it in out:
+            # tipo del evento
+            t = (it.get("type") if isinstance(it, dict) else getattr(it, "type", "")) or ""
+            t = str(t).lower()
+            if "search" in t or "web" in t:
+                used, why = True, (why + [t])
+            # metadatos/citations con URL (si existen)
+            meta = None
+            if isinstance(it, dict):
+                meta = it.get("citation") or it.get("metadata") or it.get("source")
+            else:
+                meta = getattr(it, "citation", None) or getattr(it, "metadata", None) or getattr(it, "source", None)
+            if isinstance(meta, dict):
+                url = meta.get("url") or meta.get("href") or meta.get("source_url")
+                if url:
+                    used = True
+                    why.append(f"citation:{url}")
+        return used, why
 
     try:
-        # Cliente OpenAI (usa el global si existe)
-        client = globals().get("openai_client") or OpenAI(api_key=CONFIG.get("OPENAI_API_KEY"))
+        client = globals().get("openai_client") or OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            project=os.getenv("OPENAI_PROJECT")  # opcional pero recomendado
+        )
 
-        model = "gpt-5-mini"  # Fijamos el modelo a probar
+        model = "gpt-5-mini"
 
-        # ----- Paso 1: ping (¿el endpoint acepta la herramienta?) -----
-        try:
-            ping = client.responses.create(
-                model=model,
-                input=[{"role": "user", "content": "di 'ok'"}],
-                tools=[{"type": "web_search"}],
-                max_output_tokens=32,  # >= 16 para evitar error de mínimo
-            )
-            ping_model = getattr(ping, "model", model)
-        except Exception as e_ping:
-            return jsonify({
-                "ok": False,
-                "model_requested": model,
-                "web_search_enabled": False,  # No aceptó la herramienta
-                "error": str(e_ping),
-            }), 200
+        payload = dict(
+            model=model,
+            input=[
+                {"role": "system", "content": "Usa EXACTAMENTE una búsqueda con la herramienta web_search y luego responde SOLO: ok"},
+                {"role": "user", "content": "Encuentra el sitio oficial del SRI en Ecuador y responde 'ok'."}
+            ],
+            tools=[{"type": "web_search"}],
+            tool_choice={"type": "tool", "tool_name": "web_search"},  # clave correcta
+            max_output_tokens=128
+        )
 
-        # ----- Paso 2: intento de uso (sin tool_choice; solo instrucción) -----
-        try:
-            r = client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": "Haz exactamente UNA búsqueda web y luego responde solo con 'ok'."},
-                    {"role": "user", "content": "Encuentra la página oficial del Servicio de Rentas Internas de Ecuador (SRI) usando la herramienta y luego responde 'ok'."}
-                ],
-                tools=[{"type": "web_search"}],
-                max_output_tokens=64
-            )
+        r = client.responses.create(**payload)
 
-            # Extraer señales de uso (heurística sobre metadatos en la salida estructurada)
-            used = False
-            try:
-                for item in (getattr(r, "output", []) or []):
-                    meta = None
-                    if isinstance(item, dict):
-                        meta = item.get("citation") or item.get("metadata") or item.get("source")
-                    else:
-                        meta = getattr(item, "citation", None) or getattr(item, "metadata", None)
-                    if meta:
-                        u = (meta.get("url") or meta.get("href") or meta.get("source_url") or "")
-                        if u:
-                            used = True
-                            break
-            except Exception:
-                used = False
-
-            usage = getattr(r, "usage", None)
-            return jsonify({
-                "ok": True,
-                "model_used": getattr(r, "model", ping_model),
-                "web_search_enabled": True,               # El ping pasó: la herramienta está habilitada
-                "web_search_used_in_call": used,          # Señal (heurística) de uso real en esta llamada
-                "output": getattr(r, "output_text", ""),
-                "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
-                "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
-            }), 200
-
-        except Exception as e_use:
-            # La herramienta está habilitada (pasó el ping), pero esta llamada falló por otro motivo
-            return jsonify({
-                "ok": True,
-                "model_used": ping_model,
-                "web_search_enabled": True,
-                "web_search_used_in_call": False,
-                "error_in_use_call": str(e_use),
-            }), 200
+        used, why = _used_web_search(r)
+        usage = getattr(r, "usage", None)
+        return jsonify({
+            "ok": True,
+            "model_used": getattr(r, "model", model),
+            "project": os.getenv("OPENAI_PROJECT"),
+            "web_search_enabled": True,
+            "web_search_used_in_call": used,
+            "why": why,  # pistas de por qué se detectó uso (tipos/citations)
+            "output": getattr(r, "output_text", ""),
+            "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
+            "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
+        })
 
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        # Extrae detalles ricos del error de la librería OpenAI si están disponibles
+        err = {
+            "message": str(e),
+            "type": getattr(e, "type", None),
+            "code": getattr(e, "code", None),
+            "param": getattr(e, "param", None),
+        }
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                body = resp.json()
+            except Exception:
+                try:
+                    body = resp.text
+                except Exception:
+                    body = None
+            headers = getattr(resp, "headers", {}) or {}
+            err.update({
+                "status_code": getattr(resp, "status_code", None),
+                "request_id": headers.get("x-request-id") or headers.get("x-openai-request-id"),
+                "body": body
+            })
+        # Unos frames del traceback para contexto sin inundar la salida
+        try:
+            err["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
+        except Exception:
+            pass
+
+        # No exponemos el input completo para no alargar / filtrar datos;
+        # si lo necesitas, puedes añadir 'input' al request_payload.
+        request_payload = {
+            "model": "gpt-5-mini",
+            "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "tool", "tool_name": "web_search"},
+            "max_output_tokens": 128
+        }
+
+        return jsonify({
+            "ok": False,
+            "model_requested": "gpt-5-mini",
+            "web_search_used_in_call": True,  # se intentó forzar
+            "error": err,
+            "request_payload": request_payload
+        }), 200
+
 
 
 
