@@ -1424,7 +1424,7 @@ import time
 
 import time
 
-@app.route("/responses/toolcheck", methods=["GET"])
+@app.route("/responses/toolcheck2", methods=["GET"])
 def responses_toolcheck():
     """
     Verifica Web Search con Responses API usando gpt-5-mini (sin streaming).
