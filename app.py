@@ -680,33 +680,56 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
 # ============= RESPUESTA EMPRESARIO API =============
 def generate_legal_response_empresario_API(question, context_docs, contexto_practico=None):
     """
-    Versión playground-like:
+    Versión estilo Playground:
+    - Usa Responses API con la herramienta web_search (GPT-5).
     - No usa context_docs ni añade ⚖️ Fundamento legal.
-    - Delegado a Responses API + Web Search (GPT-5 mini).
-    - Estructura práctica y enlaces como en Playground.
+    - Formato práctico con sección de “📚 Fuentes consultadas” (<ul>).
     """
-    import re, html, logging
+    import os, re, html, logging
     from urllib.parse import urlparse
 
-    # -------- Config (FORZAR GPT-5 mini) --------
-    CONFIG = globals().get("CONFIG", {}) if "CONFIG" in globals() else {}
-    model = CONFIG.get("OPENAI_MODEL_RESPONSES") or CONFIG.get("OPENAI_MODEL") or "gpt-5-mini"
-    if not str(model).startswith("gpt-5"):
-        model = "gpt-5-mini"
-    max_out = int(CONFIG.get("MAX_TOKENS", 3000))
-    temperature = 0.3
-    logging.getLogger().warning(f"[Empresario_API|Playground] Using Responses model: {model}")
+    # -------- Config del modelo (forzamos GPT-5; fallback a 5-mini si hace falta) --------
+    _cfg = globals().get("CONFIG", {}) if "CONFIG" in globals() else {}
+    model_preferido = _cfg.get("OPENAI_MODEL_RESPONSES") or "gpt-5"
+    if not str(model_preferido).startswith("gpt-5"):
+        model_preferido = "gpt-5"
+    model_fallback = "gpt-5-mini"
 
-    # -------- Cliente (Responses API) --------
+    # Límite de salida razonable para mantener costo bajo en esta ruta
+    max_out = int(_cfg.get("MAX_TOKENS", 1800))
+    max_out = max(256, min(max_out, 1800))  # clamp defensivo
+
+    # -------- Cliente OpenAI (usa OPENAI_PROJECT si existe; requerido por tools en algunas cuentas) --------
     try:
         from openai import OpenAI
+        api_key = os.getenv("OPENAI_API_KEY")
+        project = os.getenv("OPENAI_PROJECT")
+        if not api_key:
+            return ("⚠️ Falta OPENAI_API_KEY en el entorno.", 0)
         client = globals().get("openai_client", None)
         if client is None or not hasattr(client, "responses"):
-            client = OpenAI()
+            client = OpenAI(api_key=api_key, project=project) if project else OpenAI(api_key=api_key)
     except Exception as e:
-        return ("⚠️ Falta SDK OpenAI (instala `openai>=1.40`). Detalle: " + str(e), 0)
+        return ("⚠️ Falta SDK OpenAI o error creando cliente: " + str(e), 0)
 
     # -------- Helpers --------
+    def _safe_output_text(resp):
+        """Devuelve texto aunque output_text venga vacío."""
+        txt = (getattr(resp, "output_text", "") or "").strip()
+        if txt:
+            return txt
+        parts = []
+        for item in (getattr(resp, "output", []) or []):
+            try:
+                if getattr(item, "type", "") == "message":
+                    for c in getattr(item, "content", []) or []:
+                        t = getattr(c, "text", None)
+                        if t:
+                            parts.append(t)
+            except Exception:
+                pass
+        return "\n".join(p for p in parts if p).strip()
+
     def _mk_fuentes_html_from_urls(urls, titles=None, cap=7):
         titles = titles or {}
         used_domains, items = set(), []
@@ -714,7 +737,7 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
             if not u:
                 continue
             try:
-                d = urlparse(u).netloc.replace("www.","")
+                d = urlparse(u).netloc.replace("www.", "")
             except Exception:
                 d = ""
             if d in used_domains:
@@ -727,8 +750,9 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
         return "<ul>" + "\n".join(items) + "</ul>" if items else "<p>—</p>"
 
     def _extract_citations(resp):
-        """Intenta recuperar URLs/títulos desde los eventos del Responses API; si no, regex del texto."""
+        """Recolecta URLs/títulos desde items/citations y, si falta, por regex del texto."""
         urls, titles = [], {}
+        # 1) Intentar desde metadatos de items
         for item in (getattr(resp, "output", []) or []):
             try:
                 meta = {}
@@ -744,6 +768,7 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
                         titles[url] = ttl
             except Exception:
                 pass
+        # 2) Regex del texto si no hubo nada
         text = (getattr(resp, "output_text", "") or "")
         if not urls and text:
             for m in re.findall(r"https?://[^\s\)\]\}<>\"']+", text):
@@ -751,16 +776,16 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
                     urls.append(m)
         return urls, titles
 
-    # -------- Prompt estilo Playground (sin LEGAL_FACTS) --------
+    # -------- Prompt estilo Playground --------
     q = (question or "").strip()
 
     SYSTEM = (
         "Eres un asesor experto en trámites empresariales en Ecuador (es-EC, tz: America/Guayaquil). "
-        "Usa la herramienta Web Search de forma ACTIVA (varias búsquedas y contraste) priorizando dominios oficiales "
+        "Usa la herramienta Web Search de forma ACTIVA priorizando dominios oficiales "
         "(supercias.gob.ec, sri.gob.ec, gob.ec, funcionjudicial.gob.ec, registros mercantiles). "
         "Responde answer-first y NO inventes montos/plazos: si no están claros, escribe “—” y explica cómo obtenerlos. "
-        "FORMATO EXACTO (máx 8 secciones):\n"
-        "1) 🧭 Respuesta ejecutiva (bullets cortos con veredicto claro: Sí/No/Depende…)\n"
+        "FORMATO (máx 8 secciones):\n"
+        "1) 🧭 Respuesta ejecutiva (bullets, veredicto claro)\n"
         "2) Pasos oficiales\n"
         "3) Documentos mínimos\n"
         "4) Costos y tasas (si hay)\n"
@@ -768,7 +793,7 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
         "6) ✅ Acciones inmediatas / ❌ Errores comunes (opcional)\n"
         "7) 🧩 Tips operativos (opcional)\n"
         "8) 📚 Fuentes consultadas (obligatorio) como <ul> 5–7 enlaces (título + dominio), sin repetir dominio.\n"
-        "Nunca dejes la respuesta sin texto final; si aún estás buscando, escribe una síntesis útil igualmente."
+        "No pegues textos extensos de fuentes; sé conciso y útil."
     )
 
     USER = (
@@ -776,74 +801,78 @@ def generate_legal_response_empresario_API(question, context_docs, contexto_prac
         "PREGUNTA:\n" + q
     )
 
-    tools = [{"type": "web_search"}]
-    tokens_total = 0
-
-    # -------- Llamada principal (con web_search) --------
-    try:
-        r = client.responses.create(
-            model=model,
-            input=[{"role":"system","content":SYSTEM},
-                   {"role":"user","content":USER}],
-            tools=tools,
-            max_output_tokens=max_out,
-            temperature=temperature,
+    # -------- Llamada principal (web_search) --------
+    def _call_with_model(_model, use_preview=False):
+        tool = {"type": "web_search_preview"} if use_preview else {"type": "web_search"}
+        return client.responses.create(
+            model=_model,
+            input=[{"role": "system", "content": SYSTEM},
+                   {"role": "user", "content": USER}],
+            tools=[tool],
+            max_output_tokens=max_out,   # >= 16
+            # Importante: NO enviar temperature con modelos gpt-5
         )
-    except Exception as e:
-        # Fallback a web_search_preview si existe en el tenant
-        try:
-            r = client.responses.create(
-                model=model,
-                input=[{"role":"system","content":SYSTEM},
-                       {"role":"user","content":USER}],
-                tools=[{"type":"web_search_preview"}],
-                max_output_tokens=max_out,
-                temperature=temperature,
-            )
-        except Exception as e2:
-            aviso = "ℹ️ Nota: tu cuenta no tiene habilitado Web Search en Responses API; el resultado puede diferir del Playground."
-            return (aviso, 0)
 
-    # -------- Salida del modelo --------
-    respuesta = getattr(r, "output_text", "") or ""
+    tokens_total = 0
+    respuesta = ""
+    used_model = model_preferido
+    try:
+        r = _call_with_model(used_model, use_preview=False)
+    except Exception:
+        # Intento alterno con web_search_preview
+        try:
+            r = _call_with_model(used_model, use_preview=True)
+        except Exception:
+            # Fallback a gpt-5-mini con web_search
+            try:
+                used_model = model_fallback
+                r = _call_with_model(used_model, use_preview=False)
+            except Exception:
+                # Último intento: gpt-5-mini con preview
+                r = _call_with_model(used_model, use_preview=True)
+
+    # Texto y uso
+    respuesta = _safe_output_text(r)
     try:
         u = getattr(r, "usage", None)
-        tokens_total = (getattr(u, "input_tokens", 0) or 0) + (getattr(u, "output_tokens", 0) or 0)
+        if u:
+            tokens_total = (getattr(u, "input_tokens", 0) or 0) + (getattr(u, "output_tokens", 0) or 0)
     except Exception:
-        tokens_total = 0
+        pass
 
-    # -------- Si no devolvió texto, reintento sin herramientas (síntesis mínima) --------
+    # Reintento sin tools si no hubo texto (síntesis mínima)
     if not respuesta.strip():
         r2 = client.responses.create(
-            model=model,
+            model=used_model,
             input=[
-                {"role":"system","content":"Responde en el formato pedido, AUN SIN BUSCAR, usando “—” donde falten datos, y SIEMPRE incluye '📚 Fuentes consultadas' con una lista vacía si no tienes enlaces."},
-                {"role":"user","content":USER}
+                {"role": "system", "content": "Responde en el formato indicado, AUN SIN BUSCAR. Usa “—” si faltan datos."},
+                {"role": "user", "content": USER},
             ],
             max_output_tokens=min(max_out, 800),
-            temperature=0.2,
         )
-        respuesta = getattr(r2, "output_text", "") or ""
+        respuesta = _safe_output_text(r2)
         try:
             u2 = getattr(r2, "usage", None)
-            tokens_total += (getattr(u2, "input_tokens", 0) or 0) + (getattr(u2, "output_tokens", 0) or 0)
+            if u2:
+                tokens_total += (getattr(u2, "input_tokens", 0) or 0) + (getattr(u2, "output_tokens", 0) or 0)
         except Exception:
             pass
 
-    # -------- Forzar sección de Fuentes si falta --------
+    # -------- Forzar sección de Fuentes consultadas (HTML <ul>) --------
+    # Si falta, o no hay <ul>, construimos una con URLs detectadas
+    urls, titles = _extract_citations(r)
+    fuentes_html = _mk_fuentes_html_from_urls(urls, titles, cap=7)
+
     if "📚 Fuentes consultadas" not in respuesta:
-        urls, titles = _extract_citations(r)
-        fuentes_html = _mk_fuentes_html_from_urls(urls, titles, cap=7)
         respuesta = respuesta.rstrip() + "\n\n📚 Fuentes consultadas\n" + fuentes_html
     else:
-        # Si existe la sección pero sin <ul>, la completamos con las citas detectadas
         if "<ul>" not in respuesta:
-            urls, titles = _extract_citations(r)
-            fuentes_html = _mk_fuentes_html_from_urls(urls, titles, cap=7)
-            # Reemplaza el bloque de fuentes por nuestra lista HTML
-            respuesta = re.sub(r"(📚\s*Fuentes consultadas\s*)[\s\S]*$", r"\1\n" + fuentes_html, respuesta)
+            # Reemplazar bloque final de fuentes por nuestra lista HTML
+            respuesta = re.sub(r"(📚\s*Fuentes consultadas\s*)[\s\S]*$",
+                               r"\\1\n" + fuentes_html, respuesta)
 
     return respuesta, tokens_total
+
 
 
 
