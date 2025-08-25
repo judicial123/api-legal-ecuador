@@ -1448,89 +1448,95 @@ def gpt5_test():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
-@app.route("/responses/toolcheck", methods=["GET"])
+@app.route("/responses/toolcheck2", methods=["GET"])
 def responses_toolcheck():
     """
-    Check Web Search (Responses API, sin streaming):
-      - Modelo: gpt-5-mini
-      - Herramienta: web_search
-      - Devuelve señales de uso y errores con detalle.
-    Requiere:
-      - OPENAI_API_KEY (obligatorio)
-      - OPENAI_PROJECT (opcional; si falta, usa el quemado)
+    Diagnóstico de Web Search con Responses API (gpt-5-mini):
+      - Intenta STREAM (para ver eventos de herramienta). Si falla o no completa, reporta el error y los eventos capturados.
+      - Luego intenta NON-STREAM (create normal) para ver si la llamada básica funciona.
+    Devuelve:
+      - ok, model_used, project_used
+      - web_search_enabled (si la API aceptó 'tools')
+      - web_search_used_in_call (heurística a partir de eventos o output)
+      - eventos/errores detallados (request_id, status_code, body)
     """
     import os, traceback
     from flask import jsonify
     from openai import OpenAI
 
-    # ---- Ajusta aquí si quieres quemar el Project ID ----
-    PROJECT_FALLBACK = "proj_wwBIeNNC2RvV0PTfWohgF7tR"
+    PROJECT_FALLBACK = "proj_wwBIeNNC2RvV0PTfWohgF7tR"  # <-- tu project ID
     MODEL = "gpt-5-mini"
 
     api_key = os.getenv("OPENAI_API_KEY")
     project_id = os.getenv("OPENAI_PROJECT") or PROJECT_FALLBACK
-
     if not api_key:
         return jsonify({"ok": False, "error": "Falta OPENAI_API_KEY en env."}), 200
 
-    # Prompts (fuera del try para poder incluirlos en errores)
     system_msg = (
-        "Usa EXACTAMENTE UNA vez la herramienta web_search para ubicar el dominio oficial "
-        "del Servicio de Rentas Internas (SRI) de Ecuador y luego responde solamente: ok"
+        "Usa EXACTAMENTE una vez la herramienta web_search para ubicar el dominio oficial "
+        "del SRI (Ecuador). Después escribe solamente: ok"
     )
     user_msg = "Confirma el uso de web_search y responde 'ok' al final."
 
-    try:
-        client = OpenAI(api_key=api_key, project=project_id)
+    client = OpenAI(api_key=api_key, project=project_id)
 
-        # Llamada sin streaming. IMPORTANTE: no enviar 'temperature' con gpt-5 en Responses.
-        r = client.responses.create(
+    # -------- 1) Intento con STREAM para ver eventos de herramienta --------
+    stream_events = []
+    stream_web_used = False
+    stream_error = None
+    final_stream_output = ""
+    final_stream_usage = {}
+
+    try:
+        with client.responses.stream(
             model=MODEL,
             input=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
             tools=[{"type": "web_search"}],
-            max_output_tokens=128,  # mínimo aceptado >= 16
-        )
+            max_output_tokens=128
+        ) as stream:
+            for ev in stream:
+                # Guardamos tipo y hasta 800 chars del evento
+                ev_type = getattr(ev, "event", None) or type(ev).__name__
+                ev_str = str(ev)
+                stream_events.append({"type": ev_type, "sample": ev_str[:800]})
+                low = ev_str.lower()
+                # Heurística amplia para detectar uso de herramienta
+                if ("web_search" in low) or ("tool" in low and "search" in low):
+                    stream_web_used = True
 
-        usage = getattr(r, "usage", None)
-        output_text = getattr(r, "output_text", "") or ""
+            # Si el stream completó correctamente
+            final = stream.get_final_response()
+            final_stream_output = getattr(final, "output_text", "") or ""
+            usage = getattr(final, "usage", None)
+            if usage:
+                final_stream_usage = {
+                    "input_tokens": getattr(usage, "input_tokens", None),
+                    "output_tokens": getattr(usage, "output_tokens", None),
+                }
 
-        # Intento heurístico para ver si la herramienta se usó (inspeccionamos 'output')
-        web_used = False
-        output_items_sample = []
-        raw_output = getattr(r, "output", None)
-        try:
-            for item in (raw_output or []):
-                s = str(item)
-                output_items_sample.append(s[:400])
-                low = s.lower()
-                if ("web_search" in low) or ("search" in low and "tool" in low) or ("http://" in low) or ("https://" in low):
-                    web_used = True
-        except Exception:
-            pass
-
-        return jsonify({
-            "ok": True,
-            "project_used": project_id,
-            "model_used": getattr(r, "model", MODEL),
-            "web_search_enabled": True,                 # la API aceptó la herramienta
-            "web_search_used_in_call": web_used,        # inferido por el contenido de 'output'
-            "raw_has_output_list": bool(raw_output),
-            "output_items_sample": output_items_sample[:10],
-            "output": output_text,
-            "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
-            "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
-        }), 200
+            return jsonify({
+                "ok": True,
+                "mode": "stream",
+                "model_used": getattr(final, "model", MODEL),
+                "project_used": project_id,
+                "web_search_enabled": True,              # tools aceptadas
+                "web_search_used_in_call": stream_web_used,
+                "output": final_stream_output,
+                "usage": final_stream_usage,
+                "events": stream_events[:20],            # muestra primeros 20 eventos
+            }), 200
 
     except Exception as e:
-        # Error verboso con payload y metadatos
+        # Capturamos error de streaming con detalle total
         err = {
             "message": str(e),
             "type": getattr(e, "type", None),
             "code": getattr(e, "code", None),
             "param": getattr(e, "param", None),
+            "traceback_tail": traceback.format_exc().splitlines()[-6:]
         }
         resp = getattr(e, "response", None)
         if resp is not None:
@@ -1544,10 +1550,73 @@ def responses_toolcheck():
                 "request_id": headers.get("x-request-id") or headers.get("x-openai-request-id"),
                 "body": body
             })
+        stream_error = err  # guardamos para responderlo si también falla el non-stream
+
+    # -------- 2) Fallback NON-STREAM: create normal (muestra error si falla) --------
+    try:
+        r = client.responses.create(
+            model=MODEL,
+            input=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            tools=[{"type": "web_search"}],
+            max_output_tokens=128
+        )
+        usage = getattr(r, "usage", None)
+        output_text = getattr(r, "output_text", "") or ""
+        web_used = False
+
+        # Heurística en output para detectar urls/citas
+        raw_output = getattr(r, "output", None)
+        output_items_sample = []
         try:
-            err["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
+            for item in (raw_output or []):
+                s = str(item)
+                output_items_sample.append(s[:400])
+                low = s.lower()
+                if ("web_search" in low) or ("http://" in low) or ("https://" in low):
+                    web_used = True
         except Exception:
             pass
+
+        return jsonify({
+            "ok": True,
+            "mode": "non-stream",
+            "model_used": getattr(r, "model", MODEL),
+            "project_used": project_id,
+            "web_search_enabled": True,
+            "web_search_used_in_call": web_used,
+            "output": output_text,
+            "output_items_sample": output_items_sample[:10],
+            "usage": {
+                "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
+                "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
+            },
+            "stream_error_before": stream_error,   # útil para depurar por qué falló el stream
+        }), 200
+
+    except Exception as e2:
+        # Error del create normal: lo devolvemos con máximo detalle + lo que pasó en stream
+        err2 = {
+            "message": str(e2),
+            "type": getattr(e2, "type", None),
+            "code": getattr(e2, "code", None),
+            "param": getattr(e2, "param", None),
+            "traceback_tail": traceback.format_exc().splitlines()[-6:]
+        }
+        resp2 = getattr(e2, "response", None)
+        if resp2 is not None:
+            try:
+                body2 = resp2.json()
+            except Exception:
+                body2 = getattr(resp2, "text", None)
+            headers2 = getattr(resp2, "headers", {}) or {}
+            err2.update({
+                "status_code": getattr(resp2, "status_code", None),
+                "request_id": headers2.get("x-request-id") or headers2.get("x-openai-request-id"),
+                "body": body2
+            })
 
         request_payload = {
             "model": MODEL,
@@ -1564,8 +1633,11 @@ def responses_toolcheck():
             "ok": False,
             "model_requested": MODEL,
             "project_used": project_id,
+            "web_search_enabled": True,            # intentamos usar la herramienta
             "web_search_used_in_call": False,
-            "error": err,
+            "error_stream": stream_error,          # qué pasó en stream
+            "error_non_stream": err2,              # qué pasó en non-stream
+            "events_stream_captured": stream_events[:20],
             "request_payload": request_payload,
         }), 200
 
