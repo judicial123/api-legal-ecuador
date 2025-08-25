@@ -1458,14 +1458,124 @@ def responses_toolcheck():
     """
     Test de Web Search con Responses API.
     - Por defecto: MODO REAL usando la pregunta fija "como registrar una marca en ecuador".
-    - Si pasas mode=control => corre baseline + SRI (tu prueba de humo original).
+    - Si pasas mode=control => (reservado para tu baseline).
     - Puedes sobreescribir la pregunta con ?q=... si lo necesitas.
+    - preview=1 usa web_search_preview.
+    - max= (tokens de salida). Si no pasas, sube a 1800 por defecto.
     """
-    import os, re, traceback
+    import os, re, json, traceback
     from urllib.parse import urlparse
     from flask import jsonify, request
     from openai import OpenAI
 
+    # ========= Helpers =========
+    def _items_types(resp):
+        out = []
+        for it in (getattr(resp, "output", []) or []):
+            t = getattr(it, "type", None) or it.__class__.__name__
+            out.append(str(t).lower())
+        return out
+
+    def _safe_text(resp):
+        """
+        Extrae texto de assistant aunque haya tool calls en medio.
+        """
+        txt = (getattr(resp, "output_text", "") or "").strip()
+        if txt:
+            return txt
+        parts = []
+        for it in (getattr(resp, "output", []) or []):
+            try:
+                if (getattr(it, "type", "") or "").lower() == "message":
+                    for c in (getattr(it, "content", []) or []):
+                        t = getattr(c, "text", None)
+                        if t:
+                            parts.append(t)
+            except Exception:
+                pass
+        return "\n".join([p for p in parts if p]).strip()
+
+    def _count_web_calls(resp):
+        """
+        Cuenta invocaciones a la herramienta de búsqueda.
+        (Heurístico sobre 'type' del item)
+        """
+        n = 0
+        for it in (getattr(resp, "output", []) or []):
+            t = (getattr(it, "type", "") or "").lower()
+            if "web" in t and "search" in t and "call" in t:
+                n += 1
+        return n
+
+    def _extract_searches_from_text(text):
+        """
+        Intenta parsear la sección:
+        '🔎 Búsquedas realizadas (≤7)'
+        Devuelve una lista de {query, url}.
+        """
+        results = []
+        if not text:
+            return results
+        # Ubicar el bloque de búsquedas realizadas
+        # Acepta encabezados con o sin emoji y pequeñas variantes
+        pattern_header = r"^.*b(us|ús)quedas\s+realizadas.*\(≤?7\).*?$"
+        lines = text.splitlines()
+        start_idx = None
+        for i, ln in enumerate(lines):
+            if re.search(pattern_header, ln, re.IGNORECASE):
+                start_idx = i + 1
+                break
+        if start_idx is None:
+            return results
+        # Tomar hasta el siguiente encabezado de sección (línea con emoji/separador o '📚 Fuentes consultadas', etc.)
+        block = []
+        for ln in lines[start_idx:]:
+            if re.match(r"^\s*[:\-_*#]{2,}\s*$", ln):  # separadores
+                break
+            if re.match(r"^[📚🧭✅❌🧩#].*$", ln):      # otra sección
+                break
+            block.append(ln)
+        # Parsear bullets: buscar URL y una 'query' textual
+        url_rx = re.compile(r"https?://[^\s<>\")\]]+")
+        for ln in block:
+            ln_stripped = ln.strip(" -*•\t")
+            if not ln_stripped:
+                continue
+            url = None
+            m = url_rx.search(ln_stripped)
+            if m:
+                url = m.group(0)
+            # Intentar sacar la query entre comillas o después de 'query:'
+            q = None
+            m2 = re.search(r"[Qq]uery\s*[:：]\s*“([^”]+)”|[Qq]uery\s*[:：]\s*\"([^\"]+)\"|[Qq]uery\s*[:：]\s*'([^']+)'|[Qq]uery\s*[:：]\s*(.+)$", ln_stripped)
+            if m2:
+                for g in m2.groups():
+                    if g:
+                        q = g.strip()
+                        break
+            if not q:
+                # fallback: texto antes de la url o antes de ' - ' / ':' como query aproximada
+                approx = ln_stripped
+                if url:
+                    approx = approx.replace(url, "").strip()
+                approx = re.split(r"\s+-\s+|:\s+", approx, maxsplit=1)[0].strip()
+                q = approx if approx else None
+            if url or q:
+                results.append({"query": q, "url": url})
+        return results
+
+    def _link_domains(links):
+        domains = []
+        for u in links:
+            try:
+                d = urlparse(u).netloc.lower().replace("www.", "")
+                if d:
+                    domains.append(d)
+            except Exception:
+                pass
+        return domains
+
+    # ========= Configuración y cliente =========
     project = os.getenv("OPENAI_PROJECT")
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -1476,47 +1586,31 @@ def responses_toolcheck():
     except Exception as e:
         return jsonify({"ok": False, "error": f"No se pudo crear cliente OpenAI: {e}"}), 200
 
-    # ===== Parámetros =====
+    # ========= Parámetros =========
     mode = (request.args.get("mode") or "").strip().lower()
     model = (request.args.get("model") or "gpt-5").strip()
     preview = request.args.get("preview") == "1"
     try:
-        max_out = int(request.args.get("max", "1024"))
+        max_out = int(request.args.get("max", "0"))  # 0 => default 1800
     except Exception:
-        max_out = 1024
+        max_out = 0
 
-    # ===== Helpers que ya usabas (pega aquí tus _items_types, _safe_text, etc.) =====
-    def _items_types(resp):
-        out = []
-        for it in (getattr(resp, "output", []) or []):
-            t = getattr(it, "type", None) or it.__class__.__name__
-            out.append(str(t).lower())
-        return out
-
-    def _safe_text(resp):
-        txt = (getattr(resp, "output_text", "") or "").strip()
-        if txt:
-            return txt
-        parts = []
-        for it in (getattr(resp, "output", []) or []):
-            try:
-                if getattr(it, "type", "") == "message":
-                    for c in getattr(it, "content", []) or []:
-                        t = getattr(c, "text", None)
-                        if t:
-                            parts.append(t)
-            except Exception:
-                pass
-        return "\n".join(p for p in parts if p).strip()
-
-    # ===== Si NO pides mode=control => MODO REAL con la pregunta fija =====
+    # ========= MODO REAL =========
     if mode != "control":
         real_q = (request.args.get("q") or "").strip() or "como registrar una marca en ecuador"
 
         SYSTEM = (
-            "Eres un asesor experto en trámites empresariales en Ecuador. "
-            "Usa la herramienta Web Search priorizando dominios oficiales (.gob.ec, derechosintelectuales.gob.ec/SENADI, etc.). "
-            "Responde answer-first y NO inventes montos/plazos: usa “—” si faltan. "
+            "Eres un asesor experto en trámites empresariales en Ecuador.\n"
+            "Usa la herramienta Web Search priorizando dominios oficiales (.gob.ec; SENADI: derechosintelectuales.gob.ec/propiedadintelectual.gob.ec).\n"
+            "LÍMITE DURO: puedes realizar como máximo 7 llamadas a Web Search en total. "
+            "Si llegas a 7, DETENTE y redacta la respuesta con lo que tengas.\n"
+            "Responde en Markdown limpio (no JSON), siguiendo el formato solicitado y 'answer-first'. "
+            "NO inventes montos/plazos: usa “—” si no constan en fuentes oficiales.\n"
+            "Incluye SIEMPRE al final la sección: '🔎 Búsquedas realizadas (≤7)' listando cada query y una URL principal por búsqueda."
+        )
+        USER = (
+            "OBJETIVO: guía accionable con enlaces oficiales.\n\n"
+            f"PREGUNTA: {real_q}\n\n"
             "FORMATO (máx 8 secciones):\n"
             "1) 🧭 Respuesta ejecutiva (bullets, veredicto claro)\n"
             "2) Pasos oficiales\n"
@@ -1525,19 +1619,22 @@ def responses_toolcheck():
             "5) Plazos típicos (si hay)\n"
             "6) ✅ Acciones inmediatas / ❌ Errores comunes (opcional)\n"
             "7) 🧩 Tips operativos (opcional)\n"
-            "8) 📚 Fuentes consultadas en <ul> (5–7 enlaces, sin repetir dominio)."
+            "8) 📚 Fuentes consultadas (5–7 enlaces, sin repetir dominio, prioriza .gob.ec)\n\n"
+            "Al final agrega:\n"
+            "— '🔎 Búsquedas realizadas (≤7)': enumera (1) la 'query' usada y (2) una 'URL principal' por cada búsqueda ejecutada."
         )
-        USER = f"OBJETIVO: guía accionable con enlaces oficiales.\n\nPREGUNTA:\n{real_q}"
 
         tool = {"type": "web_search_preview"} if preview else {"type": "web_search"}
         req = {
             "model": model,
-            "input": [{"role":"system","content":SYSTEM},
-                      {"role":"user","content":USER}],
+            "input": [{"role": "system", "content": SYSTEM},
+                      {"role": "user", "content": USER}],
             "tools": [tool],
-            "max_output_tokens": max_out
+            "max_output_tokens": max_out if max_out and max_out > 0 else 1800,
+            "temperature": 0.2
         }
 
+        # ====== Llamada al modelo con manejo de errores detallado ======
         try:
             r = client.responses.create(**req)
         except Exception as e:
@@ -1567,51 +1664,84 @@ def responses_toolcheck():
                 "project_used": project,
             }), 200
 
+        # ====== Post-proceso / Métricas ======
         out_text = _safe_text(r)
         items_types = _items_types(r)
         usage = getattr(r, "usage", None)
         input_tokens = getattr(usage, "input_tokens", None) if usage else None
         output_tokens = getattr(usage, "output_tokens", None) if usage else None
 
-        # Señal de uso de herramienta
-        search_used = any(("web_search_call" in t) or ("web" in t and "search" in t) for t in items_types)
+        web_calls = _count_web_calls(r)
+        search_used = any(("web_search" in t) for t in items_types)
 
-        # Checks de calidad
+        # Checks de contenido/forma
+        warnings = []
+        errors = []
+
+        if not out_text:
+            errors.append("La respuesta del modelo llegó vacía o no se pudo extraer texto.")
+        # Busca encabezados clave
         has_exec = bool(re.search(r"^🧭\s*Respuesta\s+ejecutiva", out_text, re.MULTILINE | re.IGNORECASE))
+        if not has_exec:
+            warnings.append("Falta la sección '🧭 Respuesta ejecutiva'.")
+
         has_sources = "📚 Fuentes consultadas" in out_text
-        ul_count = out_text.count("<ul>")
-        links = re.findall(r"https?://[^\s<>\"']+", out_text)
-        from urllib.parse import urlparse
-        domains = []
-        for u in links:
-            try:
-                d = urlparse(u).netloc.lower().replace("www.", "")
-                if d:
-                    domains.append(d)
-            except Exception:
-                pass
+        if not has_sources:
+            warnings.append("Falta la sección '📚 Fuentes consultadas'.")
+
+        # Links (soporta Markdown)
+        link_rx = re.compile(r"https?://[^\s<>\"'\)\]]+")
+        links = link_rx.findall(out_text)
+        domains = _link_domains(links)
         gob_count = sum(1 for d in domains if d.endswith(".gob.ec"))
         unique_domains = sorted(set(domains))
 
+        # Parseo de la sección de búsquedas
+        parsed_searches = _extract_searches_from_text(out_text)
+        if web_calls > 7:
+            warnings.append(f"Se detectaron {web_calls} llamadas a Web Search (límite ≤7).")
+        if parsed_searches and len(parsed_searches) > 7:
+            warnings.append(f"La sección '🔎 Búsquedas realizadas' lista {len(parsed_searches)} items (límite ≤7).")
+
+        # Señales finales
+        quality = {
+            "has_respuesta_ejecutiva": has_exec,
+            "has_fuentes_consultadas": has_sources,
+            "links_total": len(links),
+            "links_gob_ec": gob_count,
+            "unique_domains_sample": unique_domains[:10],
+            "web_search_calls": web_calls,
+            "violated_search_cap": web_calls > 7,
+            "parsed_searches_count": len(parsed_searches)
+        }
+
+        # "ok" lógico: hay texto y al menos una de las secciones clave
+        ok_logical = bool(out_text) and (has_exec or has_sources)
+
         return jsonify({
-            "ok": True,
+            "ok": ok_logical and not errors,
             "mode": "real",
             "fixed_question": real_q,
             "project_used": project,
             "model_used": getattr(r, "model", model),
             "web_search_used_in_output": search_used,
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-            "quality_checks": {
-                "has_respuesta_ejecutiva": has_exec,
-                "has_fuentes_consultadas": has_sources,
-                "ul_blocks": ul_count,
-                "links_total": len(links),
-                "links_gob_ec": gob_count,
-                "unique_domains_sample": unique_domains[:10],
-            },
-            "output_sample": out_text[:2000],
+            "quality_checks": quality,
+            "warnings": warnings,
+            "errors": errors,
+            "parsed_searches": parsed_searches,
+            "output_markdown": out_text,        # respuesta completa para inspección
+            "output_sample": out_text[:2000],   # primer bloque para vista rápida
             "request_payload": req
         }), 200
+
+    # ========= MODO CONTROL (placeholder para tu baseline original) =========
+    return jsonify({
+        "ok": False,
+        "mode": "control",
+        "error": "MODO CONTROL no implementado en este snippet. Pasa mode!=control para ejecutar el test real."
+    }), 200
+
 
     # ===== MODO CONTROL (baseline + SRI) tal cual lo tenías =====
     # ... (deja aquí tu bloque de modo control sin cambios) ...
