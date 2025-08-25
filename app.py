@@ -1424,33 +1424,26 @@ import time
 
 import time
 
-@app.route("/responses/toolcheck1", methods=["GET"])
+@app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
     """
-    Verifica Web Search en Responses API (gpt-5-mini) SIN streaming.
-    Hace 2 llamadas:
-      A) baseline (sin tools) -> debe devolver texto ("ok")
-      B) con tools=[web_search] -> pide que pegue el dominio del SRI y termine con 'ok'
-    Devuelve:
-      - ok, model_used, project_used
-      - baseline_ok, toolcall_ok, web_search_used_in_output (heurística)
-      - usage, request_payloads, y detalles de error (status_code, request_id, body)
-      - sample de output_items (para diagnosticar casos donde solo llega 'reasoning')
-    Requiere: OPENAI_API_KEY; usa project_id quemado si no hay OPENAI_PROJECT.
+    Verifica Web Search con Responses API usando gpt-5-mini (sin streaming).
+    - A) baseline: sin herramientas -> debe devolver texto ("ok")
+    - B) con tools=[web_search]: exige encontrar "sri.gob.ec" y terminar con "ok"
+    Retorna payloads, usage y errores detallados.
     """
     import os, re, traceback
     from flask import jsonify
     from openai import OpenAI
 
-    PROJECT_FALLBACK = "proj_wwBIeNNC2RvV0PTfWohgF7tR"  # <-- tu project_id
+    PROJECT_ID = "proj_wwBIeNNC2RvV0PTfWohgF7tR"  # <-- tu project_id quemado
     MODEL = "gpt-5-mini"
 
     api_key = os.getenv("OPENAI_API_KEY")
-    project_id = os.getenv("OPENAI_PROJECT") or PROJECT_FALLBACK
     if not api_key:
         return jsonify({"ok": False, "error": "Falta OPENAI_API_KEY en env."}), 200
 
-    client = OpenAI(api_key=api_key, project=project_id)
+    client = OpenAI(api_key=api_key, project=os.getenv("OPENAI_PROJECT") or PROJECT_ID)
 
     def _safe_err(e):
         err = {
@@ -1478,11 +1471,7 @@ def responses_toolcheck():
         out = []
         try:
             for it in (getattr(obj, "output", []) or []):
-                try:
-                    t = getattr(it, "type", None) or it.__class__.__name__
-                    out.append(t)
-                except Exception:
-                    out.append(str(type(it)))
+                out.append(getattr(it, "type", None) or it.__class__.__name__)
         except Exception:
             pass
         return out[:20]
@@ -1490,8 +1479,11 @@ def responses_toolcheck():
     # -------- A) Baseline sin herramientas --------
     baseline_req = {
         "model": MODEL,
-        "input": [{"role": "user", "content": "di 'ok' y nada más"}],
-        "max_output_tokens": 64
+        "input": [
+            {"role": "system", "content": "Responde en una sola palabra."},
+            {"role": "user", "content": "di 'ok' y nada más"}
+        ],
+        "max_output_tokens": 256  # subir para que deje tokens luego del 'reasoning'
     }
     baseline = {
         "ok": False, "output": "", "usage": None, "error": None,
@@ -1506,21 +1498,24 @@ def responses_toolcheck():
             "input_tokens": getattr(usage0, "input_tokens", None) if usage0 else None,
             "output_tokens": getattr(usage0, "output_tokens", None) if usage0 else None,
         }
-        # diagnosticar tipos de items que vinieron
         baseline["items_types"] = _items_types(r0)
         try:
             for it in (getattr(r0, "output", []) or []):
-                baseline["output_items_sample"].append((getattr(it, "type", None) or it.__class__.__name__, str(it)[:400]))
+                baseline["output_items_sample"].append(
+                    (getattr(it, "type", None) or it.__class__.__name__, str(it)[:400])
+                )
         except Exception:
             pass
     except Exception as e:
         baseline["error"] = _safe_err(e)
 
-    # -------- B) Con web_search (sin stream) --------
-    # Pedimos explícitamente que pegue el dominio encontrado y termine con "ok"
-    sys_b = ("Haz UNA sola búsqueda con web_search para encontrar el dominio oficial del SRI en Ecuador. "
-             "Luego responde en DOS líneas: 1) pega SOLO el dominio, 2) escribe: ok")
-    user_b = "Encuentra el dominio oficial del SRI (Ecuador) y sigue el formato indicado."
+    # -------- B) Con web_search (sin streaming) --------
+    sys_b = (
+        "Debes llamar EXACTAMENTE UNA VEZ a la herramienta web_search para encontrar el dominio oficial del SRI en Ecuador. "
+        "Evita razonamiento largo. Tras la búsqueda, responde en DOS líneas: "
+        "1) pega SOLO el dominio (por ejemplo: sri.gob.ec), 2) escribe: ok"
+    )
+    user_b = "Encuentra el dominio oficial del SRI (Ecuador) con web_search y sigue el formato indicado."
 
     tool_req = {
         "model": MODEL,
@@ -1529,7 +1524,7 @@ def responses_toolcheck():
             {"role": "user", "content": user_b},
         ],
         "tools": [{"type": "web_search"}],
-        "max_output_tokens": 128
+        "max_output_tokens": 1024  # alto para que alcance a tool + respuesta final
     }
     tool = {
         "ok": False, "output": "", "usage": None, "error": None,
@@ -1547,18 +1542,39 @@ def responses_toolcheck():
         tool["items_types"] = _items_types(r1)
         try:
             for it in (getattr(r1, "output", []) or []):
-                tool["output_items_sample"].append((getattr(it, "type", None) or it.__class__.__name__, str(it)[:400]))
+                tool["output_items_sample"].append(
+                    (getattr(it, "type", None) or it.__class__.__name__, str(it)[:400])
+                )
         except Exception:
             pass
 
-        # Heurística: considerar que usó la búsqueda si en el texto aparece un dominio/URL plausible del SRI
+        # Heurística: marcamos True si el texto trae sri.gob.ec o cualquier URL
         txt = (tool["output"] or "").lower()
-        # Permitimos que ponga dominio o URL
-        if any(pat in txt for pat in ["sri.gob.ec", "http://sri.gob.ec", "https://sri.gob.ec"]):
+        if "sri.gob.ec" in txt:
             tool["web_search_used_in_output"] = True
-        # segunda heurística: si el modelo imprimió cualquier URL o dominio, marcamos True (débil)
-        if not tool["web_search_used_in_output"]:
-            if re.search(r"(https?://|www\.)[a-z0-9\-\.]+\.[a-z]{2,}", txt):
+        elif re.search(r"(https?://|www\.)[a-z0-9\-\.]+\.[a-z]{2,}", txt):
+            tool["web_search_used_in_output"] = True
+
+        # Si sigue vacío, segundo intento con aún más tokens y copia-pega explícito
+        if not tool["output"].strip():
+            tool_req_retry = dict(tool_req)
+            tool_req_retry["input"] = [
+                {"role": "system", "content":
+                    "Llama UNA VEZ a web_search, identifica el dominio oficial del SRI y DEVUELVE inmediatamente:\n"
+                    "Línea 1: el dominio (solo dominio)\nLínea 2: ok\nNo hagas razonamiento visible."
+                 },
+                {"role": "user", "content": "Repite la instrucción y devuelve el resultado ahora."}
+            ]
+            tool_req_retry["max_output_tokens"] = 1536
+            r1b = client.responses.create(**tool_req_retry)
+            usage1b = getattr(r1b, "usage", None)
+            tool["output"] = getattr(r1b, "output_text", "") or tool["output"]
+            tool["usage"] = {
+                "input_tokens": (tool["usage"]["input_tokens"] or 0) + (getattr(usage1b, "input_tokens", 0) or 0),
+                "output_tokens": (tool["usage"]["output_tokens"] or 0) + (getattr(usage1b, "output_tokens", 0) or 0),
+            }
+            tool["items_types"] = _items_types(r1b) or tool["items_types"]
+            if "sri.gob.ec" in (tool["output"] or "").lower():
                 tool["web_search_used_in_output"] = True
 
     except Exception as e:
@@ -1567,7 +1583,7 @@ def responses_toolcheck():
     return jsonify({
         "ok": baseline["ok"] and tool["ok"],
         "model_used": MODEL,
-        "project_used": project_id,
+        "project_used": os.getenv("OPENAI_PROJECT") or PROJECT_ID,
 
         "baseline_ok": baseline["ok"],
         "baseline_output": baseline["output"],
@@ -1583,7 +1599,6 @@ def responses_toolcheck():
         "toolcall_error": tool["error"],
         "toolcall_request_payload": tool_req,
 
-        # Heurística de uso real (si el texto contiene dominio/URL)
         "web_search_used_in_output": tool["web_search_used_in_output"],
     }), 200
 
