@@ -1451,75 +1451,75 @@ def gpt5_test():
 @app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
     """
-    Check único:
+    Verifica Web Search con Responses API:
       - Modelo: gpt-5-mini
-      - Herramienta: web_search (forzada)
-    Devuelve si la llamada realmente usó web_search y, si falla,
-    muestra un payload de error detallado para depurar.
+      - Herramienta: web_search (sin tool_choice)
+      - Streaming: inspecciona eventos para confirmar uso real de la herramienta.
+    Requisitos:
+      - Tener Web Search habilitado en el Project.
+      - Pasar el Project al cliente (OPENAI_PROJECT).
     """
-    from openai import OpenAI
+    import os, json, traceback
     from flask import jsonify
-    import os, traceback
-
-    def _used_web_search(resp):
-        used, why = False, []
-        out = getattr(resp, "output", []) or []
-        for it in out:
-            # tipo del evento
-            t = (it.get("type") if isinstance(it, dict) else getattr(it, "type", "")) or ""
-            t = str(t).lower()
-            if "search" in t or "web" in t:
-                used, why = True, (why + [t])
-            # metadatos/citations con URL (si existen)
-            meta = None
-            if isinstance(it, dict):
-                meta = it.get("citation") or it.get("metadata") or it.get("source")
-            else:
-                meta = getattr(it, "citation", None) or getattr(it, "metadata", None) or getattr(it, "source", None)
-            if isinstance(meta, dict):
-                url = meta.get("url") or meta.get("href") or meta.get("source_url")
-                if url:
-                    used = True
-                    why.append(f"citation:{url}")
-        return used, why
+    from openai import OpenAI
 
     try:
         client = globals().get("openai_client") or OpenAI(
             api_key=os.getenv("OPENAI_API_KEY"),
-            project=os.getenv("OPENAI_PROJECT")  # opcional pero recomendado
+            project=os.getenv("OPENAI_PROJECT")  # MUY IMPORTANTE para herramientas
         )
 
         model = "gpt-5-mini"
 
-        payload = dict(
+        # Pedimos explícitamente que haga UNA búsqueda y luego diga "ok".
+        system_msg = "Realiza exactamente UNA búsqueda con la herramienta web_search para encontrar el sitio oficial del SRI en Ecuador y luego responde SOLO: ok"
+        user_msg   = "Confirma el uso de web_search y responde 'ok' al final."
+
+        # Guardamos todos los eventos del stream para inspección
+        events_dump = []
+        saw_web_search = False
+
+        with client.responses.stream(
             model=model,
             input=[
-                {"role": "system", "content": "Usa EXACTAMENTE una búsqueda con la herramienta web_search y luego responde SOLO: ok"},
-                {"role": "user", "content": "Encuentra el sitio oficial del SRI en Ecuador y responde 'ok'."}
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
             ],
             tools=[{"type": "web_search"}],
-            tool_choice={"type": "tool", "tool_name": "web_search"},  # clave correcta
-            max_output_tokens=128
-        )
+            max_output_tokens=128,
+            temperature=0,  # más obediente
+        ) as stream:
+            for event in stream:
+                # Serializamos el evento a texto para inspección ligera
+                try:
+                    evt_txt = str(event)
+                except Exception:
+                    evt_txt = repr(event)
+                events_dump.append(evt_txt[:800])  # recorte defensivo
 
-        r = client.responses.create(**payload)
+                # Heurística: si el evento menciona 'web_search', asumimos que la herramienta se usó
+                if "web_search" in evt_txt.lower():
+                    saw_web_search = True
 
-        used, why = _used_web_search(r)
-        usage = getattr(r, "usage", None)
+            # Respuesta final del modelo
+            final = stream.get_final_response()
+
+        usage = getattr(final, "usage", None)
+        out_text = getattr(final, "output_text", "")
+
         return jsonify({
             "ok": True,
-            "model_used": getattr(r, "model", model),
+            "model_used": getattr(final, "model", model),
             "project": os.getenv("OPENAI_PROJECT"),
-            "web_search_enabled": True,
-            "web_search_used_in_call": used,
-            "why": why,  # pistas de por qué se detectó uso (tipos/citations)
-            "output": getattr(r, "output_text", ""),
+            "web_search_enabled": True,             # habilitado a nivel de Project
+            "web_search_used_in_call": saw_web_search,
+            "output": out_text,
             "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
             "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
+            "events_sample": events_dump[:12],      # primeras entradas de eventos para depurar
         })
 
     except Exception as e:
-        # Extrae detalles ricos del error de la librería OpenAI si están disponibles
         err = {
             "message": str(e),
             "type": getattr(e, "type", None),
@@ -1531,37 +1531,23 @@ def responses_toolcheck():
             try:
                 body = resp.json()
             except Exception:
-                try:
-                    body = resp.text
-                except Exception:
-                    body = None
+                body = getattr(resp, "text", None)
             headers = getattr(resp, "headers", {}) or {}
             err.update({
                 "status_code": getattr(resp, "status_code", None),
                 "request_id": headers.get("x-request-id") or headers.get("x-openai-request-id"),
                 "body": body
             })
-        # Unos frames del traceback para contexto sin inundar la salida
         try:
             err["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
         except Exception:
             pass
 
-        # No exponemos el input completo para no alargar / filtrar datos;
-        # si lo necesitas, puedes añadir 'input' al request_payload.
-        request_payload = {
-            "model": "gpt-5-mini",
-            "tools": [{"type": "web_search"}],
-            "tool_choice": {"type": "tool", "tool_name": "web_search"},
-            "max_output_tokens": 128
-        }
-
         return jsonify({
             "ok": False,
             "model_requested": "gpt-5-mini",
-            "web_search_used_in_call": True,  # se intentó forzar
-            "error": err,
-            "request_payload": request_payload
+            "web_search_used_in_call": False,
+            "error": err
         }), 200
 
 
