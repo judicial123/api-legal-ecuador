@@ -1448,7 +1448,7 @@ def gpt5_test():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
-@app.route("/responses/toolcheck", methods=["GET"])
+@app.route("/responses/toolcheck1", methods=["GET"])
 def responses_toolcheck():
     """
     Verifica Web Search con Responses API:
