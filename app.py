@@ -1449,7 +1449,7 @@ def gpt5_test():
         return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.route("/responses/toolcheck", methods=["GET"])
-def responses_toolcheck():
+def responses_toolcheck1():
     """
     Verifica Web Search con Responses API:
       - Modelo: gpt-5-mini
