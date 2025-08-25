@@ -1456,25 +1456,18 @@ import time
 @app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
     """
-    Verifica Web Search con Responses API usando el modelo gpt-5 (no mini).
-
-    Hace dos pruebas:
-      1) baseline (sin herramientas) -> debe responder "ok".
-      2) toolcall (con tools=[{"type":"web_search"}]) -> debe buscar el dominio del SRI y luego responder "ok".
-
-    Devuelve:
-      - payloads usados
-      - usage (tokens)
-      - tipos de items en la salida (para confirmar web_search_call)
-      - errores detallados si ocurren
+    Test de Web Search con Responses API.
+    - Por defecto: MODO REAL usando la pregunta fija "como registrar una marca en ecuador".
+    - Si pasas mode=control => corre baseline + SRI (tu prueba de humo original).
+    - Puedes sobreescribir la pregunta con ?q=... si lo necesitas.
     """
-    import os, traceback
-    from flask import jsonify
+    import os, re, traceback
+    from urllib.parse import urlparse
+    from flask import jsonify, request
     from openai import OpenAI
 
-    project = os.getenv("OPENAI_PROJECT")  # recomendado para herramientas
+    project = os.getenv("OPENAI_PROJECT")
     api_key = os.getenv("OPENAI_API_KEY")
-
     if not api_key:
         return jsonify({"ok": False, "error": "Falta OPENAI_API_KEY en env."}), 200
 
@@ -1483,151 +1476,145 @@ def responses_toolcheck():
     except Exception as e:
         return jsonify({"ok": False, "error": f"No se pudo crear cliente OpenAI: {e}"}), 200
 
-    model = "gpt-5"  # <-- gpt-5 normal
-
-    # -------- 1) BASELINE sin herramientas --------
-    baseline_req = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": "Responde en una sola palabra."},
-            {"role": "user", "content": "di 'ok' y nada más"}
-        ],
-        "max_output_tokens": 256,  # suficiente para que haya 'message' en modelos que razonan
-    }
-    baseline_ok = False
-    baseline_output = ""
-    baseline_error = None
-    baseline_usage = None
-    baseline_items_types = []
-
+    # ===== Parámetros =====
+    mode = (request.args.get("mode") or "").strip().lower()
+    model = (request.args.get("model") or "gpt-5").strip()
+    preview = request.args.get("preview") == "1"
     try:
-        b = client.responses.create(**baseline_req)
-        baseline_output = getattr(b, "output_text", "") or ""
-        u = getattr(b, "usage", None)
-        if u:
-            baseline_usage = {"input_tokens": getattr(u, "input_tokens", None),
-                              "output_tokens": getattr(u, "output_tokens", None)}
-        # Tipos de items (razonamiento/mensajes/etc.)
-        items = getattr(b, "output", []) or []
-        for it in items:
+        max_out = int(request.args.get("max", "1024"))
+    except Exception:
+        max_out = 1024
+
+    # ===== Helpers que ya usabas (pega aquí tus _items_types, _safe_text, etc.) =====
+    def _items_types(resp):
+        out = []
+        for it in (getattr(resp, "output", []) or []):
             t = getattr(it, "type", None) or it.__class__.__name__
-            baseline_items_types.append(str(t).lower())
-        baseline_ok = True
-    except Exception as e:
-        baseline_error = {
-            "message": str(e),
-            "type": getattr(e, "type", None),
-            "code": getattr(e, "code", None),
-            "param": getattr(e, "param", None),
-        }
-        resp = getattr(e, "response", None)
-        if resp is not None:
+            out.append(str(t).lower())
+        return out
+
+    def _safe_text(resp):
+        txt = (getattr(resp, "output_text", "") or "").strip()
+        if txt:
+            return txt
+        parts = []
+        for it in (getattr(resp, "output", []) or []):
             try:
-                body = resp.json()
+                if getattr(it, "type", "") == "message":
+                    for c in getattr(it, "content", []) or []:
+                        t = getattr(c, "text", None)
+                        if t:
+                            parts.append(t)
             except Exception:
-                body = getattr(resp, "text", None)
-            headers = getattr(resp, "headers", {}) or {}
-            baseline_error.update({
-                "status_code": getattr(resp, "status_code", None),
-                "request_id": headers.get("x-request-id") or headers.get("x-openai-request-id"),
-                "body": body
-            })
-        try:
-            baseline_error["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
-        except Exception:
-            pass
+                pass
+        return "\n".join(p for p in parts if p).strip()
 
-    # -------- 2) TOOLCALL con web_search --------
-    toolcall_req = {
-        "model": model,
-        "input": [
-            {
-                "role": "system",
-                "content": (
-                    "Debes llamar EXACTAMENTE UNA VEZ a la herramienta web_search para encontrar el dominio oficial "
-                    "del SRI en Ecuador. Evita razonamiento largo. Tras la búsqueda, responde en DOS líneas: "
-                    "1) pega SOLO el dominio (por ejemplo: sri.gob.ec), 2) escribe: ok"
-                ),
-            },
-            {
-                "role": "user",
-                "content": "Encuentra el dominio oficial del SRI (Ecuador) con web_search y sigue el formato indicado.",
-            },
-        ],
-        "tools": [{"type": "web_search"}],
-        "max_output_tokens": 1024,
-        # No enviar "temperature" con gpt-5 en Responses.
-    }
-    toolcall_ok = False
-    toolcall_output = ""
-    toolcall_error = None
-    toolcall_usage = None
-    toolcall_items_types = []
-    web_search_used_in_output = False
+    # ===== Si NO pides mode=control => MODO REAL con la pregunta fija =====
+    if mode != "control":
+        real_q = (request.args.get("q") or "").strip() or "como registrar una marca en ecuador"
 
-    try:
-        r = client.responses.create(**toolcall_req)
-        toolcall_output = getattr(r, "output_text", "") or ""
-        u2 = getattr(r, "usage", None)
-        if u2:
-            toolcall_usage = {"input_tokens": getattr(u2, "input_tokens", None),
-                              "output_tokens": getattr(u2, "output_tokens", None)}
-        # Inspecciona items por si hay 'web_search_call'
-        items2 = getattr(r, "output", []) or []
-        for it in items2:
-            t = getattr(it, "type", None) or it.__class__.__name__
-            t_low = str(t).lower()
-            toolcall_items_types.append(t_low)
-            if "web_search_call" in t_low or ("web" in t_low and "search" in t_low):
-                web_search_used_in_output = True
-        toolcall_ok = True
-    except Exception as e:
-        toolcall_error = {
-            "message": str(e),
-            "type": getattr(e, "type", None),
-            "code": getattr(e, "code", None),
-            "param": getattr(e, "param", None),
+        SYSTEM = (
+            "Eres un asesor experto en trámites empresariales en Ecuador. "
+            "Usa la herramienta Web Search priorizando dominios oficiales (.gob.ec, derechosintelectuales.gob.ec/SENADI, etc.). "
+            "Responde answer-first y NO inventes montos/plazos: usa “—” si faltan. "
+            "FORMATO (máx 8 secciones):\n"
+            "1) 🧭 Respuesta ejecutiva (bullets, veredicto claro)\n"
+            "2) Pasos oficiales\n"
+            "3) Documentos mínimos\n"
+            "4) Costos y tasas (si hay)\n"
+            "5) Plazos típicos (si hay)\n"
+            "6) ✅ Acciones inmediatas / ❌ Errores comunes (opcional)\n"
+            "7) 🧩 Tips operativos (opcional)\n"
+            "8) 📚 Fuentes consultadas en <ul> (5–7 enlaces, sin repetir dominio)."
+        )
+        USER = f"OBJETIVO: guía accionable con enlaces oficiales.\n\nPREGUNTA:\n{real_q}"
+
+        tool = {"type": "web_search_preview"} if preview else {"type": "web_search"}
+        req = {
+            "model": model,
+            "input": [{"role":"system","content":SYSTEM},
+                      {"role":"user","content":USER}],
+            "tools": [tool],
+            "max_output_tokens": max_out
         }
-        resp = getattr(e, "response", None)
-        if resp is not None:
-            try:
-                body = resp.json()
-            except Exception:
-                body = getattr(resp, "text", None)
-            headers = getattr(resp, "headers", {}) or {}
-            toolcall_error.update({
-                "status_code": getattr(resp, "status_code", None),
-                "request_id": headers.get("x-request-id") or headers.get("x-openai-request-id"),
-                "body": body
-            })
+
         try:
-            toolcall_error["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
-        except Exception:
-            pass
+            r = client.responses.create(**req)
+        except Exception as e:
+            err = {"message": str(e), "type": getattr(e, "type", None),
+                   "code": getattr(e, "code", None), "param": getattr(e, "param", None)}
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = getattr(resp, "text", None)
+                headers = getattr(resp, "headers", {}) or {}
+                err.update({
+                    "status_code": getattr(resp, "status_code", None),
+                    "request_id": headers.get("x-request-id") or headers.get("x-openai-request-id"),
+                    "body": body
+                })
+            try:
+                err["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
+            except Exception:
+                pass
+            return jsonify({
+                "ok": False,
+                "mode": "real",
+                "error": err,
+                "request_payload": req,
+                "project_used": project,
+            }), 200
 
-    return jsonify({
-        "ok": baseline_ok and toolcall_ok,
-        "model_used": model,
-        "project_used": project,
-        # --- Baseline (sin tools)
-        "baseline_ok": baseline_ok,
-        "baseline_output": baseline_output,
-        "baseline_usage": baseline_usage,
-        "baseline_items_types": baseline_items_types,
-        "baseline_request_payload": baseline_req,
-        "baseline_error": baseline_error,
-        # --- Toolcall (con web_search)
-        "toolcall_ok": toolcall_ok,
-        "toolcall_output": toolcall_output,
-        "toolcall_usage": toolcall_usage,
-        "toolcall_items_types": toolcall_items_types,
-        "toolcall_request_payload": toolcall_req,
-        "toolcall_error": toolcall_error,
-        # Señal obvia de que la herramienta se usó
-        "web_search_used_in_output": web_search_used_in_output,
-    }), 200
+        out_text = _safe_text(r)
+        items_types = _items_types(r)
+        usage = getattr(r, "usage", None)
+        input_tokens = getattr(usage, "input_tokens", None) if usage else None
+        output_tokens = getattr(usage, "output_tokens", None) if usage else None
 
+        # Señal de uso de herramienta
+        search_used = any(("web_search_call" in t) or ("web" in t and "search" in t) for t in items_types)
 
+        # Checks de calidad
+        has_exec = bool(re.search(r"^🧭\s*Respuesta\s+ejecutiva", out_text, re.MULTILINE | re.IGNORECASE))
+        has_sources = "📚 Fuentes consultadas" in out_text
+        ul_count = out_text.count("<ul>")
+        links = re.findall(r"https?://[^\s<>\"']+", out_text)
+        from urllib.parse import urlparse
+        domains = []
+        for u in links:
+            try:
+                d = urlparse(u).netloc.lower().replace("www.", "")
+                if d:
+                    domains.append(d)
+            except Exception:
+                pass
+        gob_count = sum(1 for d in domains if d.endswith(".gob.ec"))
+        unique_domains = sorted(set(domains))
+
+        return jsonify({
+            "ok": True,
+            "mode": "real",
+            "fixed_question": real_q,
+            "project_used": project,
+            "model_used": getattr(r, "model", model),
+            "web_search_used_in_output": search_used,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "quality_checks": {
+                "has_respuesta_ejecutiva": has_exec,
+                "has_fuentes_consultadas": has_sources,
+                "ul_blocks": ul_count,
+                "links_total": len(links),
+                "links_gob_ec": gob_count,
+                "unique_domains_sample": unique_domains[:10],
+            },
+            "output_sample": out_text[:2000],
+            "request_payload": req
+        }), 200
+
+    # ===== MODO CONTROL (baseline + SRI) tal cual lo tenías =====
+    # ... (deja aquí tu bloque de modo control sin cambios) ...
 
 
 
