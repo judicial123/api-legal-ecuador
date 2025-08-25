@@ -1448,7 +1448,7 @@ def gpt5_test():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
-@app.route("/responses/toolcheck", methods=["GET"])
+@app.route("/responses/toolcheck1", methods=["GET"])
 def responses_toolcheck():
     """
     Verifica si Web Search está habilitado para Responses API con gpt-5-mini.
@@ -1533,6 +1533,7 @@ def responses_toolcheck():
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 
