@@ -1451,83 +1451,81 @@ def gpt5_test():
 @app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
     """
-    Verifica Web Search con Responses API usando proyecto QUEMADO.
+    Check Web Search (Responses API, sin streaming):
       - Modelo: gpt-5-mini
-      - Herramienta: web_search (sin tool_choice)
-      - Streaming: inspecciona eventos para confirmar uso real de la herramienta.
+      - Herramienta: web_search
+      - Devuelve señales de uso y errores con detalle.
     Requiere:
-      - OPENAI_API_KEY en el entorno.
+      - OPENAI_API_KEY (obligatorio)
+      - OPENAI_PROJECT (opcional; si falta, usa el quemado)
     """
     import os, traceback
     from flask import jsonify
     from openai import OpenAI
 
-    PROJECT_ID = "proj_wwBIeNNC2RvV0PTfWohgF7tR"  # <-- Project ID quemado
+    # ---- Ajusta aquí si quieres quemar el Project ID ----
+    PROJECT_FALLBACK = "proj_wwBIeNNC2RvV0PTfWohgF7tR"
     MODEL = "gpt-5-mini"
 
-    # --- Validación mínima ---
-    if not os.getenv("OPENAI_API_KEY"):
+    api_key = os.getenv("OPENAI_API_KEY")
+    project_id = os.getenv("OPENAI_PROJECT") or PROJECT_FALLBACK
+
+    if not api_key:
         return jsonify({"ok": False, "error": "Falta OPENAI_API_KEY en env."}), 200
 
-    # Prompts (definidos fuera del try para usarlos en errores)
+    # Prompts (fuera del try para poder incluirlos en errores)
     system_msg = (
-        "Realiza exactamente UNA búsqueda con la herramienta web_search para encontrar el "
-        "sitio oficial del SRI en Ecuador y luego responde SOLO: ok"
+        "Usa EXACTAMENTE UNA vez la herramienta web_search para ubicar el dominio oficial "
+        "del Servicio de Rentas Internas (SRI) de Ecuador y luego responde solamente: ok"
     )
     user_msg = "Confirma el uso de web_search y responde 'ok' al final."
 
     try:
-        # Cliente forzado al proyecto quemado (ignoramos el cliente global)
-        client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            project=PROJECT_ID,
-        )
+        client = OpenAI(api_key=api_key, project=project_id)
 
-        events_dump = []
-        saw_web_search = False
-
-        # Llamada con streaming (no enviar 'temperature' con gpt-5 en Responses)
-        with client.responses.stream(
+        # Llamada sin streaming. IMPORTANTE: no enviar 'temperature' con gpt-5 en Responses.
+        r = client.responses.create(
             model=MODEL,
             input=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
             tools=[{"type": "web_search"}],
-            max_output_tokens=128,  # >= 16
-        ) as stream:
-            for event in stream:
-                # Serializa cada evento para depurar
-                try:
-                    evt_txt = str(event)
-                except Exception:
-                    evt_txt = repr(event)
-                events_dump.append(evt_txt[:800])  # recorte defensivo
+            max_output_tokens=128,  # mínimo aceptado >= 16
+        )
 
-                low = evt_txt.lower()
-                # Heurística: detectar mención a la herramienta (tool call/result)
-                if ("web_search" in low) or ("tool" in low and "search" in low):
-                    saw_web_search = True
+        usage = getattr(r, "usage", None)
+        output_text = getattr(r, "output_text", "") or ""
 
-            final = stream.get_final_response()
-
-        usage = getattr(final, "usage", None)
-        out_text = getattr(final, "output_text", "")
+        # Intento heurístico para ver si la herramienta se usó (inspeccionamos 'output')
+        web_used = False
+        output_items_sample = []
+        raw_output = getattr(r, "output", None)
+        try:
+            for item in (raw_output or []):
+                s = str(item)
+                output_items_sample.append(s[:400])
+                low = s.lower()
+                if ("web_search" in low) or ("search" in low and "tool" in low) or ("http://" in low) or ("https://" in low):
+                    web_used = True
+        except Exception:
+            pass
 
         return jsonify({
             "ok": True,
-            "model_used": getattr(final, "model", MODEL),
-            "project_used": PROJECT_ID,
-            "web_search_enabled": True,                # si el Project permite herramientas, esta llamada debería pasar
-            "web_search_used_in_call": saw_web_search, # confirmado por eventos
-            "output": out_text,
+            "project_used": project_id,
+            "model_used": getattr(r, "model", MODEL),
+            "web_search_enabled": True,                 # la API aceptó la herramienta
+            "web_search_used_in_call": web_used,        # inferido por el contenido de 'output'
+            "raw_has_output_list": bool(raw_output),
+            "output_items_sample": output_items_sample[:10],
+            "output": output_text,
             "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
             "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
-            "events_sample": events_dump[:12],
         }), 200
 
     except Exception as e:
-        # Error verboso con payload y metadatos de respuesta
+        # Error verboso con payload y metadatos
         err = {
             "message": str(e),
             "type": getattr(e, "type", None),
@@ -1553,7 +1551,7 @@ def responses_toolcheck():
 
         request_payload = {
             "model": MODEL,
-            "project": PROJECT_ID,
+            "project": project_id,
             "tools": [{"type": "web_search"}],
             "max_output_tokens": 128,
             "input": [
@@ -1565,7 +1563,7 @@ def responses_toolcheck():
         return jsonify({
             "ok": False,
             "model_requested": MODEL,
-            "project_used": PROJECT_ID,
+            "project_used": project_id,
             "web_search_used_in_call": False,
             "error": err,
             "request_payload": request_payload,
