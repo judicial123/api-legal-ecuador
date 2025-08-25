@@ -1449,36 +1449,44 @@ def gpt5_test():
         return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.route("/responses/toolcheck", methods=["GET"])
-def responses_toolcheck1():
+def responses_toolcheck():
     """
     Verifica Web Search con Responses API:
       - Modelo: gpt-5-mini
       - Herramienta: web_search (sin tool_choice)
       - Streaming: inspecciona eventos para confirmar uso real de la herramienta.
-    Requisitos:
-      - Tener Web Search habilitado en el Project.
-      - Pasar el Project al cliente (OPENAI_PROJECT).
+    Requiere:
+      - OPENAI_API_KEY y OPENAI_PROJECT en el entorno.
+      - Web Search habilitado en ese Project.
     """
     import os, json, traceback
     from flask import jsonify
     from openai import OpenAI
 
+    # --- Validaciones de entorno útiles ---
+    if not os.getenv("OPENAI_API_KEY"):
+        return jsonify({"ok": False, "error": "Falta OPENAI_API_KEY en env."}), 200
+    if not os.getenv("OPENAI_PROJECT"):
+        return jsonify({"ok": False, "error": "Falta OPENAI_PROJECT en env (requerido para herramientas)."}), 200
+
     try:
         client = globals().get("openai_client") or OpenAI(
             api_key=os.getenv("OPENAI_API_KEY"),
-            project=os.getenv("OPENAI_PROJECT")  # MUY IMPORTANTE para herramientas
+            project=os.getenv("OPENAI_PROJECT")
         )
 
         model = "gpt-5-mini"
 
-        # Pedimos explícitamente que haga UNA búsqueda y luego diga "ok".
-        system_msg = "Realiza exactamente UNA búsqueda con la herramienta web_search para encontrar el sitio oficial del SRI en Ecuador y luego responde SOLO: ok"
-        user_msg   = "Confirma el uso de web_search y responde 'ok' al final."
+        system_msg = (
+            "Realiza exactamente UNA búsqueda con la herramienta web_search para encontrar el "
+            "sitio oficial del SRI en Ecuador y luego responde SOLO: ok"
+        )
+        user_msg = "Confirma el uso de web_search y responde 'ok' al final."
 
-        # Guardamos todos los eventos del stream para inspección
         events_dump = []
         saw_web_search = False
 
+        # --- Llamada con streaming (NO enviar temperature con gpt-5) ---
         with client.responses.stream(
             model=model,
             input=[
@@ -1486,22 +1494,21 @@ def responses_toolcheck1():
                 {"role": "user", "content": user_msg},
             ],
             tools=[{"type": "web_search"}],
-            max_output_tokens=128,
-            temperature=0,  # más obediente
+            max_output_tokens=128,  # >=16 para evitar error de mínimo
         ) as stream:
             for event in stream:
-                # Serializamos el evento a texto para inspección ligera
+                # Serializa cada evento para inspección
                 try:
                     evt_txt = str(event)
                 except Exception:
                     evt_txt = repr(event)
                 events_dump.append(evt_txt[:800])  # recorte defensivo
 
-                # Heurística: si el evento menciona 'web_search', asumimos que la herramienta se usó
-                if "web_search" in evt_txt.lower():
+                # Heurística amplia: si el evento menciona la herramienta
+                low = evt_txt.lower()
+                if ("web_search" in low) or ("tool" in low and "search" in low):
                     saw_web_search = True
 
-            # Respuesta final del modelo
             final = stream.get_final_response()
 
         usage = getattr(final, "usage", None)
@@ -1511,15 +1518,16 @@ def responses_toolcheck1():
             "ok": True,
             "model_used": getattr(final, "model", model),
             "project": os.getenv("OPENAI_PROJECT"),
-            "web_search_enabled": True,             # habilitado a nivel de Project
-            "web_search_used_in_call": saw_web_search,
+            "web_search_enabled": True,               # asumimos habilitado por Project
+            "web_search_used_in_call": saw_web_search, # confirmado por eventos
             "output": out_text,
             "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
             "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
-            "events_sample": events_dump[:12],      # primeras entradas de eventos para depurar
+            "events_sample": events_dump[:12],
         })
 
     except Exception as e:
+        # Armamos error verbose con payload y respuesta cruda del SDK
         err = {
             "message": str(e),
             "type": getattr(e, "type", None),
@@ -1543,11 +1551,23 @@ def responses_toolcheck1():
         except Exception:
             pass
 
+        # Para depuración, devolvemos también el payload que intentamos enviar
+        request_payload = {
+            "model": "gpt-5-mini",
+            "tools": [{"type": "web_search"}],
+            "max_output_tokens": 128,
+            "input": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        }
+
         return jsonify({
             "ok": False,
             "model_requested": "gpt-5-mini",
             "web_search_used_in_call": False,
-            "error": err
+            "error": err,
+            "request_payload": request_payload,
         }), 200
 
 
