@@ -1450,9 +1450,6 @@ def test_contexto_practico():
 # ============= probar 5 =============
 import time
 
-
-import time
-
 @app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
     """
@@ -1630,8 +1627,7 @@ def responses_toolcheck():
             "input": [{"role": "system", "content": SYSTEM},
                       {"role": "user", "content": USER}],
             "tools": [tool],
-            "max_output_tokens": max_out if max_out and max_out > 0 else 1800,
-            "temperature": 0.2
+            "max_output_tokens": max_out if max_out and max_out > 0 else 1800
         }
 
         # ====== Llamada al modelo con manejo de errores detallado ======
@@ -1741,6 +1737,7 @@ def responses_toolcheck():
         "mode": "control",
         "error": "MODO CONTROL no implementado en este snippet. Pasa mode!=control para ejecutar el test real."
     }), 200
+
 
 
     # ===== MODO CONTROL (baseline + SRI) tal cual lo tenías =====
