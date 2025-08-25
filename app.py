@@ -1451,10 +1451,9 @@ def gpt5_test():
 @app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
     """
-    Prueba ÚNICA:
-      - Modelo: gpt-5-mini (slug válido para "5 mini")
-      - Herramienta: web_search (SIN fallback)
-    Devuelve si web_search está disponible y un eco simple de salida.
+    Verifica si Web Search está habilitado para Responses API con gpt-5-mini.
+    - Paso 1 (ping): intenta una llamada con tools=[{"type": "web_search"}] para confirmar que el endpoint acepta la herramienta.
+    - Paso 2 (uso): instruye a hacer UNA búsqueda y luego responder 'ok'; intenta detectar si hubo señales de uso de la herramienta.
     """
     from openai import OpenAI
     from flask import jsonify
@@ -1463,36 +1462,78 @@ def responses_toolcheck():
         # Cliente OpenAI (usa el global si existe)
         client = globals().get("openai_client") or OpenAI(api_key=CONFIG.get("OPENAI_API_KEY"))
 
-        model = "gpt-5-mini"  # slug válido; no uses "gpt-5.1-mini"
+        model = "gpt-5-mini"  # Fijamos el modelo a probar
 
-        r = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": "Haz exactamente UNA búsqueda web y luego responde solo: ok"},
-                {"role": "user", "content": "Confirma que puedes usar web_search encontrando el sitio oficial del SRI en Ecuador y luego responde 'ok'."}
-            ],
-            tools=[{"type": "web_search"}],
-            tool_choice={"type": "tool", "name": "web_search"},  # fuerza uso de web_search
-            max_output_tokens=64,  # >= 16 para evitar error
-        )
+        # ----- Paso 1: ping (¿el endpoint acepta la herramienta?) -----
+        try:
+            ping = client.responses.create(
+                model=model,
+                input=[{"role": "user", "content": "di 'ok'"}],
+                tools=[{"type": "web_search"}],
+                max_output_tokens=32,  # >= 16 para evitar error de mínimo
+            )
+            ping_model = getattr(ping, "model", model)
+        except Exception as e_ping:
+            return jsonify({
+                "ok": False,
+                "model_requested": model,
+                "web_search_enabled": False,  # No aceptó la herramienta
+                "error": str(e_ping),
+            }), 200
 
-        usage = getattr(r, "usage", None)
-        return jsonify({
-            "ok": True,
-            "model_used": getattr(r, "model", model),
-            "web_search_available": True,          # si llegamos aquí, la llamada con web_search funcionó
-            "output": getattr(r, "output_text", ""),
-            "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
-            "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
-        })
+        # ----- Paso 2: intento de uso (sin tool_choice; solo instrucción) -----
+        try:
+            r = client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": "Haz exactamente UNA búsqueda web y luego responde solo con 'ok'."},
+                    {"role": "user", "content": "Encuentra la página oficial del Servicio de Rentas Internas de Ecuador (SRI) usando la herramienta y luego responde 'ok'."}
+                ],
+                tools=[{"type": "web_search"}],
+                max_output_tokens=64
+            )
+
+            # Extraer señales de uso (heurística sobre metadatos en la salida estructurada)
+            used = False
+            try:
+                for item in (getattr(r, "output", []) or []):
+                    meta = None
+                    if isinstance(item, dict):
+                        meta = item.get("citation") or item.get("metadata") or item.get("source")
+                    else:
+                        meta = getattr(item, "citation", None) or getattr(item, "metadata", None)
+                    if meta:
+                        u = (meta.get("url") or meta.get("href") or meta.get("source_url") or "")
+                        if u:
+                            used = True
+                            break
+            except Exception:
+                used = False
+
+            usage = getattr(r, "usage", None)
+            return jsonify({
+                "ok": True,
+                "model_used": getattr(r, "model", ping_model),
+                "web_search_enabled": True,               # El ping pasó: la herramienta está habilitada
+                "web_search_used_in_call": used,          # Señal (heurística) de uso real en esta llamada
+                "output": getattr(r, "output_text", ""),
+                "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
+                "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
+            }), 200
+
+        except Exception as e_use:
+            # La herramienta está habilitada (pasó el ping), pero esta llamada falló por otro motivo
+            return jsonify({
+                "ok": True,
+                "model_used": ping_model,
+                "web_search_enabled": True,
+                "web_search_used_in_call": False,
+                "error_in_use_call": str(e_use),
+            }), 200
+
     except Exception as e:
-        # Si falla, interpretamos que web_search no está disponible (o hay otro problema con la llamada)
-        return jsonify({
-            "ok": False,
-            "model_used": "gpt-5-mini",
-            "web_search_available": False,
-            "error": str(e),
-        }), 200
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 
