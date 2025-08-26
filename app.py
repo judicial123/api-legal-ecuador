@@ -1449,155 +1449,172 @@ def test_contexto_practico():
 
 # ============= probar 5 =============
 import time
-# --- GET /responses/testMarca (ultra-minimal, nunca en blanco) ---
+# --- GET /responses/testMarca (solo info desde internet, sin contenido hardcodeado) ---
 app.view_functions.pop("responses_testMarca", None)
 
 @app.route("/responses/testMarca", methods=["GET"])
 def responses_testMarca():
-    import os, html as htmlmod, re
+    """
+    Devuelve HTML 'answer-first' para:
+    'Pasos, costos y plazos para registrar una marca en Ecuador (SENADI)'.
+
+    Solo usa información de internet (Web Search). Si el modelo no puede citar fuentes
+    oficiales para montos/plazos, pone '—' y explica cómo verificar. Sin contenido
+    curado/local si falla: en su lugar muestra un mensaje de error con diagnóstico.
+    """
+    import os, re, html as htmlmod
     from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
     from flask import Response
-    try:
-        from openai import OpenAI
-    except Exception as e:
-        # Ni siquiera pudo importar: igual devolvemos HTML visible
-        return Response(f"<!doctype html><meta charset='utf-8'><h2>🟢 Endpoint ok</h2><p class='mono'>openai import error:</p><pre>{htmlmod.escape(str(e))}</pre>", mimetype="text/html; charset=utf-8")
+    from openai import OpenAI
 
-    # --- helpers mínimos ---
+    # ---------- helpers ----------
     def _safe_text(resp):
-        try:
-            t = (getattr(resp, "output_text", "") or "").strip()
-            if t: return t
-        except Exception:
-            pass
+        t = (getattr(resp, "output_text", "") or "").strip()
+        if t: return t
         parts = []
-        try:
-            for it in (getattr(resp, "output", []) or []):
-                if (getattr(it, "type", "") or "").lower() == "message":
-                    for c in (getattr(it, "content", []) or []):
-                        tx = getattr(c, "text", None)
-                        if tx: parts.append(tx)
-        except Exception:
-            pass
+        for it in (getattr(resp, "output", []) or []):
+            if (getattr(it, "type", "") or "").lower() == "message":
+                for c in (getattr(it, "content", []) or []):
+                    tx = getattr(c, "text", None)
+                    if tx: parts.append(tx)
         return "\n".join(parts).strip()
 
-    def _strip_tracking(text: str) -> str:
+    def _strip_tracking_urls(text: str) -> str:
         if not text: return text
         def _clean(u):
             try:
                 p = urlparse(u)
                 qs = [(k,v) for (k,v) in parse_qsl(p.query, keep_blank_values=True)
                       if not (k.lower().startswith("utm_") or k.lower() in {"gclid","fbclid","ref"})]
-                return urlunparse((p.scheme,p.netloc,p.path,p.params,("&".join([f"{k}={v}" for k,v in qs]) if qs else ""),p.fragment))
+                return urlunparse((p.scheme,p.netloc,p.path,p.params,
+                                   "&".join([f"{k}={v}" for k,v in qs]) if qs else "", p.fragment))
             except Exception:
                 return u
         return re.sub(r"https?://[^\s<>\)\]\"']+", lambda m: _clean(m.group(0)), text)
 
-    def _page(body: str, note: str = "") -> str:
-        return f"""<!doctype html><html lang="es"><meta charset="utf-8">
+    def _wrap_html(body: str, title="Registro de marca en Ecuador — SENADI"):
+        style = """
 <style>
-body{{font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0}}
-.article{{max-width:880px;margin:24px auto;padding:24px}}
-.mono{{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#555}}
-h1,h2{{margin:.2rem 0 .6rem}}
-.banner{{background:#eef4ff;padding:12px 16px;border:1px solid #d7e3ff;border-radius:10px;margin-bottom:14px}}
-a{{color:#1b72ff}}
-pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px solid #e8edf3;padding:12px;border-radius:10px}}
-</style>
-<div class="article">
-  <div class="banner">🟢 <strong>Endpoint activo.</strong> Si ves esto, <em>nunca</em> es una página en blanco.</div>
-  {body}
-  {('<details><summary class="mono">debug</summary>'+note+'</details>') if note else ''}
-</div></html>"""
+:root { --ink:#0b1320; --muted:#5b6472; --brand:#1b72ff; --bg:#fff; }
+html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Arial}
+.article{max-width:900px;margin:24px auto;padding:24px}
+h1,h2,h3{line-height:1.25;margin:18px 0 10px} h1{font-size:26px} h2{font-size:22px} h3{font-size:18px}
+p,li{color:#1d2430} ul,ol{padding-left:22px}
+a{color:var(--brand);text-decoration:none} a:hover{text-decoration:underline}
+table{border-collapse:collapse;width:100%;margin:10px 0;border:1px solid #e8edf3}
+th,td{border:1px solid #e8edf3;padding:10px;text-align:left}
+.badge{display:inline-block;padding:4px 10px;border-radius:999px;background:#eef4ff;color:#1b4dff;font-weight:600;font-size:12px}
+hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#555}
+.banner{background:#eef4ff;padding:12px 16px;border:1px solid #d7e3ff;border-radius:10px;margin-bottom:14px}
+.error{background:#fff7f7;border:1px solid #ffd6d6;border-radius:10px;padding:14px}
+</style>"""
+        return f"<!doctype html><html lang='es'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{htmlmod.escape(title)}</title>{style}</head><body><article class='article'><div class='banner'>🟢 Endpoint activo</div>{body}</article></body></html>"
 
-    # --- banner + intento de modelo ---
-    banner_body = "<h2>Registro de marca en Ecuador (SENADI)</h2>"
-    api_key = os.getenv("OPENAI_API_KEY")
-    project = os.getenv("OPENAI_PROJECT")
+    def _looks_complete(html: str) -> bool:
+        """Mínimos de calidad sin asumir valores: requiere secciones y fuentes."""
+        if not html or len(re.sub(r"<[^>]+>", "", html).strip()) < 300:
+            return False
+        needed = [r"Resumen", r"Pasos", r"Costos", r"Plazos", r"Fuentes"]
+        for n in needed:
+            if not re.search(n, html, re.I):
+                return False
+        # al menos 3 enlaces totales y >=2 oficiales (.gob.ec o derechosintelectuales.gob.ec)
+        links = re.findall(r'href=[\'"](https?://[^\'"]+)', html, re.I)
+        if len(set(links)) < 3:
+            return False
+        official = [u for u in links if re.search(r'(derechosintelectuales\.gob\.ec|\.gob\.ec)', u)]
+        return len(set(official)) >= 2
 
+    def _error_card(msg: str, raw: str = "") -> str:
+        det = f"<details><summary class='mono'>detalle</summary><pre class='mono'>{htmlmod.escape(raw)[:5000]}</pre></details>" if raw else ""
+        return f"<div class='error'><h3>⚠️ No se pudo construir la respuesta solo con fuentes oficiales</h3><p>{htmlmod.escape(msg)}</p>{det}</div>"
+
+    # ---------- cliente ----------
+    api_key = os.getenv("OPENAI_API_KEY"); project = os.getenv("OPENAI_PROJECT")
     if not api_key:
-        body = banner_body + "<p>⚠️ Falta <code>OPENAI_API_KEY</code> en el entorno.</p>"
-        return Response(_page(body), mimetype="text/html; charset=utf-8")
-
-    # cliente
+        return Response(_wrap_html(_error_card("Falta OPENAI_API_KEY.")), mimetype="text/html; charset=utf-8")
     try:
         client = OpenAI(api_key=api_key, project=project)
     except Exception as e:
-        body = banner_body + "<h3>⚠️ No se pudo crear cliente OpenAI</h3><pre class='mono'>" + htmlmod.escape(str(e)) + "</pre>"
-        return Response(_page(body), mimetype="text/html; charset=utf-8")
+        return Response(_wrap_html(_error_card("No se pudo crear el cliente OpenAI.", str(e))), mimetype="text/html; charset=utf-8")
 
-    # prompt fijo
+    # ---------- prompt (ENFATIZA: nada inventado; todo con fuentes web) ----------
     SYSTEM = (
-        "Eres un asesor experto en SENADI. Devuelve SOLO HTML válido en español, answer-first. "
-        "Puedes usar Web Search (≤7). Prioriza dominios oficiales (.gob.ec; derechosintelectuales.gob.ec / propiedadintelectual.gob.ec) y OMPI."
-        "Estructura: <h2>🧭 Resumen rápido</h2><h2>Pasos oficiales</h2><h2>Costos y tasas</h2><h2>Plazos</h2>"
-        "<h2>📚 Fuentes consultadas</h2><h2>🔎 Búsquedas realizadas (≤7)</h2>. "
-        "Si no hay dato oficial, usa '—' y di cómo verificar."
+        "Eres un asesor experto en SENADI (Ecuador). Devuelves SOLO HTML válido en español, answer-first. "
+        "Usa Web Search (≤7); prioriza SENADI (.gob.ec, derechosintelectuales.gob.ec/propiedadintelectual.gob.ec) y OMPI/WIPO. "
+        "Reglas: "
+        "• Cada monto/plazo debe estar respaldado por una URL oficial enlazada. Si no hay fuente oficial clara, escribe '—' y agrega una nota 'Cómo verificar' con la ruta exacta en el sitio oficial. "
+        "• Prohibidos 'rangos orientativos' para tasas oficiales. "
+        "• Estructura esperada: "
+        "<h2>🧭 Resumen rápido</h2>"
+        "<h2>Pasos oficiales</h2>"
+        "<h2>Costos y tasas</h2>"
+        "<h2>Plazos</h2>"
+        "<h2>📚 Fuentes consultadas</h2> (5–7 enlaces, dominios únicos, preferencia oficial)"
+        "<h2>🔎 Búsquedas realizadas (≤7)</h2> (query + URL principal). "
+        "• Cierra oraciones y secciones; no termines en tool-call."
     )
-    USER = "Pasos, costos y plazos para registrar una marca en Ecuador (SENADI)."
+    USER = (
+        "Pasos, costos y plazos para registrar una marca en Ecuador (SENADI). "
+        "Incluye Casillero virtual, Solicitudes en línea (signos distintivos), publicación en Gaceta con oposiciones (30 días hábiles), "
+        "Clasificación de Niza (OMPI), vigencia de 10 años. "
+        "Repite: no inventes montos/plazos; si no constan en fuente oficial, usa '—' y explica cómo verificar."
+    )
 
-    req = {
+    req1 = {
         "model": "gpt-5",
-        "tools": [{"type": "web_search"}],
+        "tools": [{"type": "web_search_preview"}],
         "input": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "max_output_tokens": 1600
+        "max_output_tokens": 2400
     }
 
-    # llamada principal
-    raw_note = ""
+    # ---------- llamada 1 ----------
+    raw1 = ""
     try:
-        r = client.responses.create(**req)
-        # intenta obtener texto
-        text = _safe_text(r)
-        text = _strip_tracking(text)
-        if not text or not text.strip():
-            # fallback sin herramientas
+        r1 = client.responses.create(**req1)
+        raw1 = getattr(r1, "model_dump_json", lambda: "{}")()
+        html = _strip_tracking_urls(_safe_text(r1))
+    except Exception as e:
+        return Response(_wrap_html(_error_card("Error en Responses API (intento 1).", str(e))), mimetype="text/html; charset=utf-8")
+
+    # Si vacío o incompleto -> repair pass (con Web Search, sin inyectar contenido)
+    if not _looks_complete(html):
+        try:
+            repair_inst = (
+                "Mejora la respuesta cumpliendo TODO: "
+                "• cada monto/plazo con enlace oficial; si no hay fuente, '—' + 'Cómo verificar' (ruta exacta en el sitio oficial), "
+                "• incluir al menos 2 enlaces de dominios oficiales SENADI/.gob.ec y OMPI para Niza, "
+                "• mantener secciones pedidas. Devuelve SOLO HTML."
+            )
             r2 = client.responses.create(
                 model="gpt-5",
+                tools=[{"type":"web_search_preview"}],
                 input=[
-                    {"role":"system","content":"Entrega AHORA la respuesta final en HTML válido (máx 700 palabras), SIN usar herramientas."},
+                    {"role":"system","content": SYSTEM},
                     {"role":"user","content": USER},
+                    {"role":"assistant","content": html[:6000] if html else ""},
+                    {"role":"user","content": repair_inst},
                 ],
-                max_output_tokens=900
+                max_output_tokens=2000
             )
-            text = _safe_text(r2)
-            text = _strip_tracking(text)
-        raw_note = htmlmod.escape(getattr(r, "model_dump_json", lambda:"{}")())
-    except Exception as e:
-        # si falla todo, mostramos error pero SIEMPRE con contenido visible
-        err = htmlmod.escape(str(e))
-        body = banner_body + f"<h3>⚠️ Error consultando el modelo</h3><pre class='mono'>{err}</pre>"
-        return Response(_page(body), mimetype="text/html; charset=utf-8")
+            raw2 = getattr(r2, "model_dump_json", lambda: "{}")()
+            html2 = _strip_tracking_urls(_safe_text(r2))
+            if _looks_complete(html2):
+                html = html2
+        except Exception as e:
+            # seguimos con lo que haya en html
+            raw1 += f"\n\n[repair_error]: {e}"
 
-    # si aún no hay texto, insertamos contenido estático mínimo (para nunca quedar en blanco)
-    if not text or len(re.sub(r"<[^>]+>", "", text).strip()) < 100:
-        static_html = """
-<h2>🧭 Resumen rápido</h2>
-<ul><li>Autoridad: SENADI. Vigencia: 10 años. Oposición: 30 días hábiles tras publicación.</li></ul>
-<h2>Pasos oficiales</h2>
-<ol>
- <li>Casillero virtual en SENADI.</li>
- <li>Solicitudes en línea → signos distintivos; completar formulario.</li>
- <li>Pagar tasa y enviar; examen de forma → Gaceta → oposiciones → examen de fondo → resolución.</li>
-</ol>
-<h2>📚 Fuentes consultadas</h2>
-<ul>
- <li><a target="_blank" rel="noopener" href="https://www.derechosintelectuales.gob.ec/como-registro-una-marca/">¿Cómo registro una marca? — SENADI</a></li>
- <li><a target="_blank" rel="noopener" href="https://www.derechosintelectuales.gob.ec/direccion-tecnica-de-signos-distintivos/">Dirección Técnica de Signos Distintivos — SENADI</a></li>
- <li><a target="_blank" rel="noopener" href="https://www.wipo.int/classifications/nice/">Clasificación de Niza — OMPI/WIPO</a></li>
-</ul>
-"""
-        body = banner_body + static_html
-        return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
+    # si sigue incompleto, devolvemos error (sin contenido curado)
+    if not _looks_complete(html):
+        msg = "No se pudo generar una guía completa únicamente con fuentes oficiales detectadas. Intenta nuevamente."
+        return Response(_wrap_html(_error_card(msg, raw1)), mimetype="text/html; charset=utf-8")
 
-    body = banner_body + text
-    return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
-
-
-
+    return Response(_wrap_html(html), mimetype="text/html; charset=utf-8")
 
 
     # ===== MODO CONTROL (baseline + SRI) tal cual lo tenías =====
