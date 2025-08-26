@@ -1450,6 +1450,7 @@ def test_contexto_practico():
 # ============= probar 5 =============
 import time
 # --- GET /responses/testMarca (ultra-minimal mejorado: más aire) ---
+# --- GET /responses/testMarca (ultra-minimal mejorado: más aire) ---
 app.view_functions.pop("responses_testMarca", None)
 
 @app.route("/responses/testMarca", methods=["GET"])
