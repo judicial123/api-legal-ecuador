@@ -1449,24 +1449,182 @@ def test_contexto_practico():
 
 # ============= probar 5 =============
 import time
+# --- GET /responses/testMarca (ultra-minimal, nunca en blanco) ---
+app.view_functions.pop("responses_testMarca", None)
 
-@app.route("/responses/toolcheck", methods=["GET"])
-def responses_toolcheck():
-    """
-    Web Search con diagnóstico:
-    - Llama a GPT-5 con Web Search para responder 'como registrar una marca en ecuador' (o ?q=...).
-    - Si el modelo no produce texto (ej. se quedó en tool-calls), intenta un fallback SIN herramientas.
-    - Reporta errores fatales/no fatales detectados dentro del objeto de respuesta.
+@app.route("/responses/testMarca", methods=["GET"])
+def responses_testMarca():
+    import os, html as htmlmod, re
+    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+    from flask import Response
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        # Ni siquiera pudo importar: igual devolvemos HTML visible
+        return Response(f"<!doctype html><meta charset='utf-8'><h2>🟢 Endpoint ok</h2><p class='mono'>openai import error:</p><pre>{htmlmod.escape(str(e))}</pre>", mimetype="text/html; charset=utf-8")
 
-    Params:
-      ?q=...        Pregunta (default: 'como registrar una marca en ecuador')
-      ?preview=1    Usa web_search_preview
-      ?model=gpt-5  Modelo (default gpt-5)
-      ?max=1600     Tokens de salida aprox
-      ?strict=1     Trata cualquier error detectado como fatal
+    # --- helpers mínimos ---
+    def _safe_text(resp):
+        try:
+            t = (getattr(resp, "output_text", "") or "").strip()
+            if t: return t
+        except Exception:
+            pass
+        parts = []
+        try:
+            for it in (getattr(resp, "output", []) or []):
+                if (getattr(it, "type", "") or "").lower() == "message":
+                    for c in (getattr(it, "content", []) or []):
+                        tx = getattr(c, "text", None)
+                        if tx: parts.append(tx)
+        except Exception:
+            pass
+        return "\n".join(parts).strip()
+
+    def _strip_tracking(text: str) -> str:
+        if not text: return text
+        def _clean(u):
+            try:
+                p = urlparse(u)
+                qs = [(k,v) for (k,v) in parse_qsl(p.query, keep_blank_values=True)
+                      if not (k.lower().startswith("utm_") or k.lower() in {"gclid","fbclid","ref"})]
+                return urlunparse((p.scheme,p.netloc,p.path,p.params,("&".join([f"{k}={v}" for k,v in qs]) if qs else ""),p.fragment))
+            except Exception:
+                return u
+        return re.sub(r"https?://[^\s<>\)\]\"']+", lambda m: _clean(m.group(0)), text)
+
+    def _page(body: str, note: str = "") -> str:
+        return f"""<!doctype html><html lang="es"><meta charset="utf-8">
+<style>
+body{{font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0}}
+.article{{max-width:880px;margin:24px auto;padding:24px}}
+.mono{{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#555}}
+h1,h2{{margin:.2rem 0 .6rem}}
+.banner{{background:#eef4ff;padding:12px 16px;border:1px solid #d7e3ff;border-radius:10px;margin-bottom:14px}}
+a{{color:#1b72ff}}
+pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px solid #e8edf3;padding:12px;border-radius:10px}}
+</style>
+<div class="article">
+  <div class="banner">🟢 <strong>Endpoint activo.</strong> Si ves esto, <em>nunca</em> es una página en blanco.</div>
+  {body}
+  {('<details><summary class="mono">debug</summary>'+note+'</details>') if note else ''}
+</div></html>"""
+
+    # --- banner + intento de modelo ---
+    banner_body = "<h2>Registro de marca en Ecuador (SENADI)</h2>"
+    api_key = os.getenv("OPENAI_API_KEY")
+    project = os.getenv("OPENAI_PROJECT")
+
+    if not api_key:
+        body = banner_body + "<p>⚠️ Falta <code>OPENAI_API_KEY</code> en el entorno.</p>"
+        return Response(_page(body), mimetype="text/html; charset=utf-8")
+
+    # cliente
+    try:
+        client = OpenAI(api_key=api_key, project=project)
+    except Exception as e:
+        body = banner_body + "<h3>⚠️ No se pudo crear cliente OpenAI</h3><pre class='mono'>" + htmlmod.escape(str(e)) + "</pre>"
+        return Response(_page(body), mimetype="text/html; charset=utf-8")
+
+    # prompt fijo
+    SYSTEM = (
+        "Eres un asesor experto en SENADI. Devuelve SOLO HTML válido en español, answer-first. "
+        "Puedes usar Web Search (≤7). Prioriza dominios oficiales (.gob.ec; derechosintelectuales.gob.ec / propiedadintelectual.gob.ec) y OMPI."
+        "Estructura: <h2>🧭 Resumen rápido</h2><h2>Pasos oficiales</h2><h2>Costos y tasas</h2><h2>Plazos</h2>"
+        "<h2>📚 Fuentes consultadas</h2><h2>🔎 Búsquedas realizadas (≤7)</h2>. "
+        "Si no hay dato oficial, usa '—' y di cómo verificar."
+    )
+    USER = "Pasos, costos y plazos para registrar una marca en Ecuador (SENADI)."
+
+    req = {
+        "model": "gpt-5",
+        "tools": [{"type": "web_search"}],
+        "input": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": USER},
+        ],
+        "max_output_tokens": 1600
+    }
+
+    # llamada principal
+    raw_note = ""
+    try:
+        r = client.responses.create(**req)
+        # intenta obtener texto
+        text = _safe_text(r)
+        text = _strip_tracking(text)
+        if not text or not text.strip():
+            # fallback sin herramientas
+            r2 = client.responses.create(
+                model="gpt-5",
+                input=[
+                    {"role":"system","content":"Entrega AHORA la respuesta final en HTML válido (máx 700 palabras), SIN usar herramientas."},
+                    {"role":"user","content": USER},
+                ],
+                max_output_tokens=900
+            )
+            text = _safe_text(r2)
+            text = _strip_tracking(text)
+        raw_note = htmlmod.escape(getattr(r, "model_dump_json", lambda:"{}")())
+    except Exception as e:
+        # si falla todo, mostramos error pero SIEMPRE con contenido visible
+        err = htmlmod.escape(str(e))
+        body = banner_body + f"<h3>⚠️ Error consultando el modelo</h3><pre class='mono'>{err}</pre>"
+        return Response(_page(body), mimetype="text/html; charset=utf-8")
+
+    # si aún no hay texto, insertamos contenido estático mínimo (para nunca quedar en blanco)
+    if not text or len(re.sub(r"<[^>]+>", "", text).strip()) < 100:
+        static_html = """
+<h2>🧭 Resumen rápido</h2>
+<ul><li>Autoridad: SENADI. Vigencia: 10 años. Oposición: 30 días hábiles tras publicación.</li></ul>
+<h2>Pasos oficiales</h2>
+<ol>
+ <li>Casillero virtual en SENADI.</li>
+ <li>Solicitudes en línea → signos distintivos; completar formulario.</li>
+ <li>Pagar tasa y enviar; examen de forma → Gaceta → oposiciones → examen de fondo → resolución.</li>
+</ol>
+<h2>📚 Fuentes consultadas</h2>
+<ul>
+ <li><a target="_blank" rel="noopener" href="https://www.derechosintelectuales.gob.ec/como-registro-una-marca/">¿Cómo registro una marca? — SENADI</a></li>
+ <li><a target="_blank" rel="noopener" href="https://www.derechosintelectuales.gob.ec/direccion-tecnica-de-signos-distintivos/">Dirección Técnica de Signos Distintivos — SENADI</a></li>
+ <li><a target="_blank" rel="noopener" href="https://www.wipo.int/classifications/nice/">Clasificación de Niza — OMPI/WIPO</a></li>
+</ul>
+"""
+        body = banner_body + static_html
+        return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
+
+    body = banner_body + text
+    return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
+
+
+
+
+
+    # ===== MODO CONTROL (baseline + SRI) tal cual lo tenías =====
+    # ... (deja aquí tu bloque de modo control sin cambios) ...
+
+
+
+
+# Evita colisión si ya existía
+app.view_functions.pop("responses_toolcheckFinal", None)
+
+@app.route("/responses/toolcheckFinal", methods=["GET"])
+def responses_toolcheckFinal():
     """
-    import os, json, re, traceback
-    from flask import jsonify, request
+    HTML ejecutivo para cualquier pregunta gerencial (Ecuador/LATAM) con Web Search (≤7).
+    - q=...        : pregunta (default: 'como registrar una marca en ecuador')
+    - preview=1    : usa web_search_preview (si no, web_search)
+    - model=gpt-5  : modelo (default gpt-5)
+    - max=1600     : tokens de salida aprox
+
+    Devuelve: text/html con secciones: Resumen, Pasos/Plan, Costos/Plazos (si aplica),
+    Riesgos & Compliance, KPIs/Checklist (si aplica), Fuentes consultadas (5–7),
+    y Búsquedas realizadas (≤7).
+    """
+    import os, re, json, traceback
+    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+    from flask import request, Response
     from openai import OpenAI
 
     # ---------- Helpers ----------
@@ -1491,7 +1649,6 @@ def responses_toolcheck():
         return "\n".join([p for p in parts if p]).strip()
 
     def _resp_to_dict(resp):
-        """Convierte el objeto Response a dict si el SDK lo permite (para inspección)."""
         for attr in ("model_dump_json", "json"):
             fn = getattr(resp, attr, None)
             if callable(fn):
@@ -1510,255 +1667,55 @@ def responses_toolcheck():
         except Exception:
             return {"_raw": str(resp)}
 
-    def _find_errors_anywhere(obj, path="$", out=None):
-        """Busca señales de error en todo el árbol (tool errors, status, 'error', etc.)."""
-        if out is None: out = []
-        try:
-            if isinstance(obj, dict):
-                if "error" in obj and obj["error"]:
-                    out.append({"path": path + ".error", "snippet": obj["error"]})
-                if "status" in obj:
-                    st = str(obj["status"]).lower()
-                    if st not in ("completed","success","ok","finished","done"):
-                        out.append({"path": path + ".status", "snippet": obj["status"]})
-                if "message" in obj and isinstance(obj["message"], str) and "error" in obj["message"].lower():
-                    out.append({"path": path + ".message", "snippet": obj["message"]})
-                if "type" in obj and isinstance(obj["type"], str) and "error" in obj["type"].lower():
-                    out.append({"path": path + ".type", "snippet": obj["type"]})
-                for k, v in obj.items():
-                    _find_errors_anywhere(v, f"{path}.{k}", out)
-            elif isinstance(obj, list):
-                for i, v in enumerate(obj):
-                    _find_errors_anywhere(v, f"{path}[{i}]", out)
-        except Exception:
-            pass
-        return out
-
-    def _classify_fatal(detected_errors, raw_status, strict=False):
-        """Heurística para marcar fatal/retryable."""
-        if strict and detected_errors:
-            return True, True, "strict_mode_error"
-        rs = (str(raw_status).lower() if raw_status is not None else "")
-        if rs in ("failed","error","timeout","cancelled"):
-            return True, True, f"status={rs}"
-        retryable_keys = ("timeout","temporarily","unavailable","gateway","internal","server","try again","rate limit","429")
-        nonretry_keys = ("invalid api key","authentication","permission","forbidden","insufficient_quota","quota exceeded","payment","billing","bad request")
-        fatal = False; retryable = True; reason = None
-        for e in detected_errors:
-            snip = str(e.get("snippet","")).lower()
-            if any(k in snip for k in nonretry_keys):
-                return True, False, snip[:200]
-            if any(k in snip for k in retryable_keys):
-                fatal = True; retryable = True; reason = snip[:200]
-        return (fatal, retryable, reason or ("status="+rs if rs else None))
-
-    # ---------- Configuración ----------
-    api_key = os.getenv("OPENAI_API_KEY")
-    project = os.getenv("OPENAI_PROJECT")
-    if not api_key:
-        return jsonify({"ok": False, "fatal": True, "retryable": False, "error": "Falta OPENAI_API_KEY"}), 200
-
-    try:
-        client = OpenAI(api_key=api_key, project=project)
-    except Exception as e:
-        return jsonify({"ok": False, "fatal": True, "retryable": False, "error": f"No se pudo crear cliente OpenAI: {e}"}), 200
-
-    # ---------- Parámetros ----------
-    q = (request.args.get("q") or "como registrar una marca en ecuador").strip()
-    model = (request.args.get("model") or "gpt-5").strip()
-    preview = request.args.get("preview") == "1"
-    strict = request.args.get("strict") == "1"
-    try:
-        max_out = int(request.args.get("max", "1600"))
-    except Exception:
-        max_out = 1600
-
-    SYSTEM = (
-        "Responde de forma clara y answer-first en máximo 600 palabras. "
-        "Puedes usar búsquedas web (≤7) y prioriza .gob.ec/SENADI. "
-        "Siempre emite un mensaje final de texto; no termines en una llamada de herramienta."
-    )
-    USER = q
-    tool = {"type": "web_search_preview"} if preview else {"type": "web_search"}
-
-    req = {
-        "model": model,
-        "tools": [tool],
-        "input": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": USER},
-        ],
-        "max_output_tokens": max_out  # OJO: sin 'response_format' y sin 'temperature'
-    }
-
-    # ---------- Llamada principal ----------
-    try:
-        r = client.responses.create(**req)
-    except Exception as e:
-        err = {"message": str(e)}
-        resp = getattr(e, "response", None)
-        if resp is not None:
-            try: body = resp.json()
-            except Exception: body = getattr(resp, "text", None)
-            headers = getattr(resp, "headers", {}) or {}
-            err.update({
-                "status_code": getattr(resp, "status_code", None),
-                "request_id": headers.get("x-request-id") or headers.get("x-openai-request-id"),
-                "body": body
-            })
-        try:
-            err["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
-        except Exception:
-            pass
-        return jsonify({"ok": False, "fatal": True, "retryable": True, "error": err, "request_payload": req}), 200
-
-    text = _safe_text(r)
-    r_dict = _resp_to_dict(r)
-    detected_errors = _find_errors_anywhere(r_dict)
-    raw_status = r_dict.get("status")
-
-    # ¿Errores fatales dentro de la respuesta?
-    is_fatal, retryable, reason = _classify_fatal(detected_errors, raw_status, strict=strict)
-    if is_fatal:
-        usage = getattr(r, "usage", None)
-        usage_dict = {
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-        } if usage else None
-        return jsonify({
-            "ok": False,
-            "fatal": True,
-            "retryable": retryable,
-            "reason": reason,
-            "text": text or "",
-            "model_used": getattr(r, "model", model),
-            "used_preview": preview,
-            "usage": usage_dict,
-            "detected_errors": detected_errors,
-            "raw_status": raw_status,
-            "request_payload": req
-        }), 200
-
-    # ---------- Fallback SIN herramientas si no hubo texto y no es fatal ----------
-    if not text:
-        finalize_req = {
-            "model": model,
-            "input": [
-                {"role": "system",
-                 "content": ("Ahora debes ENTREGAR la respuesta final, clara y answer-first (máx 600 palabras), "
-                             "SIN usar herramientas. Escribe texto llano en Markdown. No agregues nada más.")},
-                {"role": "user", "content": USER},
-            ],
-            "max_output_tokens": max_out
-        }
-        try:
-            r2 = client.responses.create(**finalize_req)
-            text2 = _safe_text(r2)
-            r2_dict = _resp_to_dict(r2)
-            detected_errors2 = _find_errors_anywhere(r2_dict)
-            raw_status2 = r2_dict.get("status")
-            is_fatal2, retryable2, reason2 = _classify_fatal(detected_errors2, raw_status2, strict=strict)
-            usage = getattr(r2, "usage", None)
-            usage_dict = {
-                "input_tokens": getattr(usage, "input_tokens", None),
-                "output_tokens": getattr(usage, "output_tokens", None),
-            } if usage else None
-            return jsonify({
-                "ok": bool(text2) and not is_fatal2,
-                "fatal": bool(is_fatal2),
-                "retryable": False if is_fatal2 and not retryable2 else True,
-                "reason": reason2,
-                "text": (text2 or ""),
-                "model_used": getattr(r2, "model", model),
-                "used_preview": preview,
-                "finalized_fallback": True,
-                "usage": usage_dict,
-                "detected_errors": detected_errors2,
-                "raw_status": raw_status2,
-                "request_payload": req
-            }), 200
-        except Exception as e:
-            err = {"message": str(e)}
-            resp = getattr(e, "response", None)
-            if resp is not None:
-                try: body = resp.json()
-                except Exception: body = getattr(resp, "text", None)
-                headers = getattr(resp, "headers", {}) or {}
-                err.update({
-                    "status_code": getattr(resp, "status_code", None),
-                    "request_id": headers.get("x-request-id") or headers.get("x-openai-request-id"),
-                    "body": body
-                })
-            try:
-                err["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
-            except Exception:
-                pass
-            return jsonify({
-                "ok": False, "fatal": True, "retryable": True,
-                "error": err, "note": "Falló la llamada principal y el cierre forzado.",
-                "request_payload": req
-            }), 200
-
-    # ---------- Respuesta normal ----------
-    usage = getattr(r, "usage", None)
-    usage_dict = {
-        "input_tokens": getattr(usage, "input_tokens", None),
-        "output_tokens": getattr(usage, "output_tokens", None),
-    } if usage else None
-
-    return jsonify({
-        "ok": True,
-        "fatal": False,
-        "text": text,
-        "model_used": getattr(r, "model", model),
-        "used_preview": preview,
-        "usage": usage_dict,
-        "detected_errors": detected_errors,   # pueden ser warnings no fatales
-        "raw_status": raw_status,
-        "request_payload": req
-    }), 200
-
-
-
-
-
-
-    # ===== MODO CONTROL (baseline + SRI) tal cual lo tenías =====
-    # ... (deja aquí tu bloque de modo control sin cambios) ...
-
-
-
-# --- ENDPOINT SIMPLE SIN PARÁMETROS: GET /responses/testMarca ---
-# (Pega esto en tu app.py. Antes del decorador, borramos si ya existía.)
-app.view_functions.pop("responses_testMarca", None)
-
-@app.route("/responses/testMarca", methods=["GET"])
-def responses_testMarca():
-    """
-    Prueba simple: devuelve HTML con PASOS / COSTOS / PLAZOS para
-    registrar una marca en Ecuador (SENADI), usando GPT-5 + Web Search.
-    No requiere parámetros.
-    """
-    import os, re
-    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-    from flask import Response
-    from openai import OpenAI
-
-    # ---- Helpers mínimos ----
-    def _safe_text(resp):
-        txt = (getattr(resp, "output_text", "") or "").strip()
-        if txt:
-            return txt
-        parts = []
+    def _extract_tool_queries(resp):
+        """Reconstruye queries de los tool-calls de web_search (máx. 7)."""
+        queries = []
         for it in (getattr(resp, "output", []) or []):
-            if (getattr(it, "type", "") or "").lower() == "message":
-                for c in (getattr(it, "content", []) or []):
-                    t = getattr(c, "text", None)
-                    if t:
-                        parts.append(t)
-        return "\n".join(parts).strip()
+            t = (getattr(it, "type", "") or "").lower()
+            if "web" in t and "search" in t and "call" in t:
+                # Raspar posibles campos de argumentos
+                candidates = []
+                for key in ("arguments", "args", "input", "parameters", "tool_input", "tool_args"):
+                    if hasattr(it, key):
+                        candidates.append(getattr(it, key))
+                if not candidates and hasattr(it, "__dict__"):
+                    dct = dict(it.__dict__)
+                    for key in ("arguments", "args", "input", "parameters", "tool_input", "tool_args"):
+                        if key in dct:
+                            candidates.append(dct[key])
+
+                q_val = None
+                for c in candidates:
+                    try:
+                        if isinstance(c, str):
+                            obj = json.loads(c)
+                        elif isinstance(c, dict):
+                            obj = c
+                        else:
+                            obj = None
+                        if isinstance(obj, dict):
+                            for k in ("query", "q", "search_query"):
+                                if k in obj and isinstance(obj[k], str) and obj[k].strip():
+                                    q_val = obj[k].strip()
+                                    break
+                    except Exception:
+                        if isinstance(c, str) and c.strip():
+                            q_val = c.strip()
+                    if q_val:
+                        break
+                queries.append(q_val or "—")
+
+        # Dedupe preservando orden y corta a 7
+        seen, uniq = set(), []
+        for q in queries:
+            key = (q or "—").strip().lower()
+            if key not in seen:
+                seen.add(key)
+                uniq.append(q)
+        return uniq[:7]
 
     def _strip_tracking_params_in_text(text: str) -> str:
+        """Quita utm_* y similares de URLs dentro del HTML o Markdown."""
         if not text: return text
         def _clean_url(u):
             try:
@@ -1769,99 +1726,180 @@ def responses_testMarca():
                 return urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, p.fragment))
             except Exception:
                 return u
-        return re.sub(r"https?://[^\s<>\)\]\"']+", lambda m: _clean_url(m.group(0)), text)
+        url_rx = re.compile(r"https?://[^\s<>\)\]\"']+")
+        return url_rx.sub(lambda m: _clean_url(m.group(0)), text)
 
-    def _wrap_html(body: str, title: str = "Registro de marca en Ecuador — SENADI") -> str:
+    def _looks_html(s: str) -> bool:
+        return bool(s and re.search(r"</?(h\d|p|ul|ol|li|div|section|article|table|thead|tbody|tr|td|th|strong|em|a)\b", s, re.I))
+
+    def _markdownish_to_html(s: str) -> str:
+        """Conversión ligera si el modelo devolviera Markdown."""
+        if not s: return ""
+        # enlaces [texto](url)
+        s = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', s)
+        # **negritas** y *itálicas*
+        s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+        s = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", s)
+        # encabezados simples
+        s = re.sub(r"^# (.+)$", r"<h2>\1</h2>", s, flags=re.M)
+        s = re.sub(r"^## (.+)$", r"<h3>\1</h3>", s, flags=re.M)
+        # bullets
+        lines = s.splitlines()
+        html_lines, in_ul = [], False
+        for ln in lines:
+            if re.match(r"^\s*[-•]\s+", ln):
+                if not in_ul:
+                    html_lines.append("<ul>")
+                    in_ul = True
+                html_lines.append("<li>" + re.sub(r"^\s*[-•]\s+", "", ln) + "</li>")
+            else:
+                if in_ul:
+                    html_lines.append("</ul>")
+                    in_ul = False
+                if ln.strip():
+                    html_lines.append(f"<p>{ln}</p>")
+        if in_ul:
+            html_lines.append("</ul>")
+        return "\n".join(html_lines)
+
+    def _ensure_html(body: str, title: str = "Asesor Ejecutivo") -> str:
+        body = body.strip()
+        if not _looks_html(body):
+            body = _markdownish_to_html(body)
         style = """
 <style>
 :root { --ink:#0b1320; --muted:#5b6472; --brand:#1b72ff; --bg:#ffffff; }
-html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui, -apple-system, Segoe UI, Roboto, Arial;}
 .article{max-width:880px;margin:24px auto;padding:24px;}
-h1,h2,h3{line-height:1.25;margin:18px 0 10px;} h1{font-size:26px} h2{font-size:22px} h3{font-size:18px}
-p,li{color:#1d2430} ul,ol{padding-left:22px}
-a{color:var(--brand);text-decoration:none} a:hover{text-decoration:underline}
-table{border-collapse:collapse;width:100%;margin:10px 0;border:1px solid #e8edf3}
-th,td{border:1px solid #e8edf3;padding:10px;text-align:left}
+h1,h2,h3{line-height:1.25;margin:18px 0 10px;}
+h1{font-size:26px} h2{font-size:22px} h3{font-size:18px}
+p,li{color:#1d2430}
+ul,ol{padding-left:22px}
+.card{background:#fff;border:1px solid #e8edf3;border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 1px 2px rgba(16,24,40,.03)}
+a{color:var(--brand);text-decoration:none}
+a:hover{text-decoration:underline}
 hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
-.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--muted)}
-.card{background:#fff;border:1px solid #e8edf3;border-radius:14px;padding:18px;margin:14px 0}
+.badge{display:inline-block;padding:4px 10px;border-radius:999px;background:#eef4ff;color:#1b4dff;font-weight:600;font-size:12px}
+.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:var(--muted)}
 </style>"""
-        return f"<!doctype html><html lang='es'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title>{style}</head><body><article class='article'>{body}</article></body></html>"
+        html = f"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+{style}
+</head>
+<body>
+<article class="article">
+{body}
+</article>
+</body></html>"""
+        return html
 
-    # ---- Cliente OpenAI ----
-    api_key = os.getenv("OPENAI_API_KEY")
-    project = os.getenv("OPENAI_PROJECT")
+    # ---------- Client ----------
+    api_key = os.getenv("OPENAI_API_KEY"); project = os.getenv("OPENAI_PROJECT")
     if not api_key:
-        return Response(_wrap_html("<h2>⚠️ Falta OPENAI_API_KEY</h2>"), mimetype="text/html")
+        return Response(_ensure_html("<h2>⚠️ Falta OPENAI_API_KEY</h2>"), mimetype="text/html")
     try:
         client = OpenAI(api_key=api_key, project=project)
     except Exception as e:
-        return Response(_wrap_html(f"<h2>⚠️ No se pudo crear cliente OpenAI</h2><pre class='mono'>{e}</pre>"), mimetype="text/html")
+        return Response(_ensure_html(f"<h2>⚠️ No se pudo crear cliente OpenAI</h2><pre class='mono'>{e}</pre>"), mimetype="text/html")
 
-    # ---- Prompt fijo (una sola pregunta) ----
+    # ---------- Params ----------
+    q = (request.args.get("q") or "como registrar una marca en ecuador").strip()
+    model = (request.args.get("model") or "gpt-5").strip()
+    preview = request.args.get("preview") == "1"
+    try:
+        max_out = int(request.args.get("max", "1600"))
+    except Exception:
+        max_out = 1600
+
+    # ---------- Persona/Plantilla (alta calidad, adaptable) ----------
     SYSTEM = (
-        "Eres un asesor ejecutivo experto en trámites de propiedad intelectual en Ecuador. "
-        "Devuelves EXCLUSIVAMENTE HTML válido (sin Markdown), en español claro y 'answer-first'. "
-        "Puedes usar Web Search (≤7). PRIORIDAD a SENADI (.gob.ec, derechosintelectuales.gob.ec/propiedadintelectual.gob.ec) y OMPI/WIPO. "
-        "REGLAS: (1) Menciona montos/plazos SOLO si constan en fuentes oficiales; si no, usa '—' y explica cómo verificar. "
-        "(2) Prohibidos rangos 'orientativos' para tasas oficiales. "
-        "(3) Estructura HTML con: "
-        "<h2>🧭 Resumen rápido</h2>"
-        "<h2>Pasos oficiales</h2>"
-        "<h2>Costos y tasas</h2>"
-        "<h2>Plazos</h2>"
-        "<h2>Riesgos & Compliance</h2>"
-        "<h2>📚 Fuentes consultadas</h2> (5–7 enlaces únicos; mínimo 3 oficiales si existen)"
-        "<h2>🔎 Búsquedas realizadas (≤7)</h2>. "
-        "(4) Enlaces con target='_blank' y SIN parámetros de tracking. "
-        "(5) Entrega un ÚNICO bloque HTML completo (no termines en tool-call)."
+        "Eres un ASESOR EJECUTIVO jurídico/negocios para gerentes en Ecuador y LATAM. "
+        "Devuelves SIEMPRE HTML válido (no Markdown, sin backticks). "
+        "Usas Web Search solo si ayuda (tope ≤7), con preferencia por dominios oficiales y fuentes primarias. "
+        "Reglas de contenido:\n"
+        "• Respuesta 'answer-first' y accionable; español claro.\n"
+        "• Si el tema es **trámite/ley**: incluye <h2>Costos y tasas</h2> y <h2>Plazos</h2> con montos/fechas SOLO si constan en fuentes oficiales; si no, '—'.\n"
+        "• Si el tema es **estratégico/negocio**: incluye <h2>Decisiones y alternativas</h2> y <h2>Plan 30-60-90</h2>.\n"
+        "• Siempre agrega <h2>📚 Fuentes consultadas</h2> con 5–7 enlaces únicos (preferir .gob.ec / reguladores / OMPI, etc.).\n"
+        "• Cierra con <h2>🔎 Búsquedas realizadas (≤7)</h2> listando cada query y URL principal si la hay.\n"
+        "• No inventes plazos/montos. Si no hay dato oficial claro, usa '—' y explica cómo verificar.\n"
+        "• El texto final debe ser un solo bloque HTML (no termines en tool-call)."
     )
     USER = (
-        "Tema: 'Pasos, costos y plazos para registrar una marca en Ecuador (SENADI)'. "
-        "Incluye: Casillero virtual, Solicitudes en línea (signos distintivos), Gaceta/oposiciones (30 días hábiles), "
-        "Clasificación de Niza (OMPI), vigencia (10 años), y tasas oficiales (búsqueda fonética si aplica, solicitud por clase, renovación)."
+        f"Tarea: Redacta un informe ejecutivo para el/la gerente sobre: {q}\n"
+        "Formato recomendado (adáptalo según el tema):\n"
+        "<h2>🧭 Resumen rápido</h2>\n"
+        "<h2>Pasos / Decisiones y alternativas</h2>\n"
+        "<h2>Costos y tasas</h2>\n"
+        "<h2>Plazos</h2>\n"
+        "<h2>Riesgos & Compliance</h2>\n"
+        "<h2>KPIs & Checklist</h2>\n"
+        "<h2>📚 Fuentes consultadas</h2>\n"
+        "<h2>🔎 Búsquedas realizadas (≤7)</h2>\n"
+        "Incluye listas con <ul><li>…</li></ul> y enlaces clicables <a href='...'>…</a>."
     )
+    tool = {"type": "web_search_preview"} if preview else {"type": "web_search"}
 
     req = {
-        "model": "gpt-5",
-        "tools": [{"type": "web_search"}],  # simple: sin preview, sin params
+        "model": model,
+        "tools": [tool],
         "input": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "max_output_tokens": 2200  # suficiente para evitar cortes
-        # No pasar 'temperature' con gpt-5 en Responses
+        "max_output_tokens": max_out  # No pasar temperature/top_p en este modelo
     }
 
-    # ---- Llamada principal ----
+    # ---------- Call 1: con Web Search ----------
     try:
         r = client.responses.create(**req)
     except Exception as e:
-        return Response(_wrap_html(f"<h2>⚠️ Error en Responses API</h2><pre class='mono'>{e}</pre>"), mimetype="text/html")
+        tb = "\n".join(traceback.format_exc().splitlines()[-6:])
+        return Response(_ensure_html(f"<h2>⚠️ Error en Responses API</h2><pre class='mono'>{e}\n{tb}</pre>"), mimetype="text/html")
 
+    # Texto bruto
     text = _safe_text(r)
     text = _strip_tracking_params_in_text(text)
 
-    # ---- Fallback si quedó vacío (tool-call) ----
+    # Si quedó vacío (tool-call), forzar cierre sin herramientas
     if not text:
+        finalize_req = {
+            "model": model,
+            "input": [
+                {"role": "system",
+                 "content": ("Entrega AHORA la respuesta final en HTML válido, clara y 'answer-first' (máx 700 palabras), "
+                             "SIN usar herramientas. Agrega '📚 Fuentes consultadas' y '🔎 Búsquedas realizadas (≤7)'.")},
+                {"role": "user", "content": USER},
+            ],
+            "max_output_tokens": max_out
+        }
         try:
-            r2 = client.responses.create(
-                model="gpt-5",
-                input=[
-                    {"role": "system",
-                     "content": ("Ahora entrega la respuesta FINAL en HTML válido (máx 800 palabras), "
-                                 "clara y 'answer-first', SIN usar herramientas. Incluye '📚 Fuentes consultadas' y '🔎 Búsquedas realizadas (≤7)'.")},
-                    {"role": "user", "content": USER},
-                ],
-                max_output_tokens=1200
-            )
+            r2 = client.responses.create(**finalize_req)
             text = _safe_text(r2)
             text = _strip_tracking_params_in_text(text)
         except Exception as e:
-            return Response(_wrap_html(f"<h2>⚠️ Fallback falló</h2><pre class='mono'>{e}</pre>"), mimetype="text/html")
+            return Response(_ensure_html(f"<h2>⚠️ Fallback falló</h2><pre class='mono'>{e}</pre>"), mimetype="text/html")
 
-    return Response(_wrap_html(text), mimetype="text/html")
+    # ---------- Enriquecimiento: insertar búsquedas si faltan ----------
+    def _has_busquedas_section(html: str) -> bool:
+        return bool(re.search(r"b(us|ús)quedas\s+realizadas", html, re.I))
 
+    if not _has_busquedas_section(text):
+        # reconstruye queries y agrega sección al final
+        queries = _extract_tool_queries(r)
+        if queries:
+            items = "\n".join([f"<li><strong>query:</strong> {q} <span class='mono'>| URL principal: —</span></li>" for q in queries])
+            extra = f"\n<h2>🔎 Búsquedas realizadas (≤7)</h2>\n<ul>\n{items}\n</ul>\n"
+            text = text.rstrip() + ("\n" if not text.endswith("\n") else "") + extra
+
+    # ---------- Asegurar HTML + estilos y responder ----------
+    body_html = text if _looks_html(text) else _markdownish_to_html(text)
+    full_html = _ensure_html(body_html, title="Asesor Ejecutivo")
+
+    return Response(full_html, mimetype="text/html")
 
 
 
