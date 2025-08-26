@@ -1450,7 +1450,6 @@ def test_contexto_practico():
 # ============= probar 5 =============
 import time
 # --- GET /responses/testMarca (ultra-minimal mejorado: más aire) ---
-# --- GET /responses/testMarca (ultra-minimal mejorado: más aire) ---
 app.view_functions.pop("responses_testMarca", None)
 
 @app.route("/responses/testMarca", methods=["GET"])
@@ -1605,7 +1604,6 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px so
 
     body = banner_body + text
     return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
-
 
 
 
