@@ -1729,20 +1729,28 @@ def responses_toolcheck():
 
 
 
+# Evita colisión si ya existía
+app.view_functions.pop("responses_toolcheckFinal", None)
+
 @app.route("/responses/toolcheckFinal", methods=["GET"])
 def responses_toolcheckFinal():
     """
-    /responses/toolcheck
-    - Responde en HTML (text/html) para cualquier pregunta gerencial (?q=...).
-    - Usa GPT-5 con Web Search (≤7 búsquedas) y devuelve un informe ejecutivo de alta calidad.
-    - Si el modelo no produce texto (p.ej. termina en tool-calls), fuerza un cierre SIN herramientas (HTML).
+    HTML ejecutivo para cualquier pregunta gerencial (Ecuador/LATAM) con Web Search (≤7).
+    - q=...        : pregunta (default: 'como registrar una marca en ecuador')
+    - preview=1    : usa web_search_preview (si no, web_search)
+    - model=gpt-5  : modelo (default gpt-5)
+    - max=1600     : tokens de salida aprox
+
+    Devuelve: text/html con secciones: Resumen, Pasos/Plan, Costos/Plazos (si aplica),
+    Riesgos & Compliance, KPIs/Checklist (si aplica), Fuentes consultadas (5–7),
+    y Búsquedas realizadas (≤7).
     """
     import os, re, json, traceback
     from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
     from flask import request, Response
     from openai import OpenAI
 
-    # ------------- Helpers -------------
+    # ---------- Helpers ----------
     def _safe_text(resp):
         """Extrae texto aunque output_text venga vacío."""
         try:
@@ -1782,10 +1790,56 @@ def responses_toolcheckFinal():
         except Exception:
             return {"_raw": str(resp)}
 
+    def _extract_tool_queries(resp):
+        """Reconstruye queries de los tool-calls de web_search (máx. 7)."""
+        queries = []
+        for it in (getattr(resp, "output", []) or []):
+            t = (getattr(it, "type", "") or "").lower()
+            if "web" in t and "search" in t and "call" in t:
+                # Raspar posibles campos de argumentos
+                candidates = []
+                for key in ("arguments", "args", "input", "parameters", "tool_input", "tool_args"):
+                    if hasattr(it, key):
+                        candidates.append(getattr(it, key))
+                if not candidates and hasattr(it, "__dict__"):
+                    dct = dict(it.__dict__)
+                    for key in ("arguments", "args", "input", "parameters", "tool_input", "tool_args"):
+                        if key in dct:
+                            candidates.append(dct[key])
+
+                q_val = None
+                for c in candidates:
+                    try:
+                        if isinstance(c, str):
+                            obj = json.loads(c)
+                        elif isinstance(c, dict):
+                            obj = c
+                        else:
+                            obj = None
+                        if isinstance(obj, dict):
+                            for k in ("query", "q", "search_query"):
+                                if k in obj and isinstance(obj[k], str) and obj[k].strip():
+                                    q_val = obj[k].strip()
+                                    break
+                    except Exception:
+                        if isinstance(c, str) and c.strip():
+                            q_val = c.strip()
+                    if q_val:
+                        break
+                queries.append(q_val or "—")
+
+        # Dedupe preservando orden y corta a 7
+        seen, uniq = set(), []
+        for q in queries:
+            key = (q or "—").strip().lower()
+            if key not in seen:
+                seen.add(key)
+                uniq.append(q)
+        return uniq[:7]
+
     def _strip_tracking_params_in_text(text: str) -> str:
-        """Elimina utm_* y similares de los enlaces en el HTML/Markdown plano."""
-        if not text: 
-            return text
+        """Quita utm_* y similares de URLs dentro del HTML o Markdown."""
+        if not text: return text
         def _clean_url(u):
             try:
                 p = urlparse(u)
@@ -1802,9 +1856,8 @@ def responses_toolcheckFinal():
         return bool(s and re.search(r"</?(h\d|p|ul|ol|li|div|section|article|table|thead|tbody|tr|td|th|strong|em|a)\b", s, re.I))
 
     def _markdownish_to_html(s: str) -> str:
-        """Fallback MUY básico si el modelo devolviera Markdown en vez de HTML."""
-        if not s: 
-            return ""
+        """Conversión ligera si el modelo devolviera Markdown."""
+        if not s: return ""
         # enlaces [texto](url)
         s = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', s)
         # **negritas** y *itálicas*
@@ -1833,7 +1886,6 @@ def responses_toolcheckFinal():
         return "\n".join(html_lines)
 
     def _ensure_html(body: str, title: str = "Asesor Ejecutivo") -> str:
-        """Garantiza documento HTML con estilo mínimo."""
         body = body.strip()
         if not _looks_html(body):
             body = _markdownish_to_html(body)
@@ -1841,19 +1893,17 @@ def responses_toolcheckFinal():
 <style>
 :root { --ink:#0b1320; --muted:#5b6472; --brand:#1b72ff; --bg:#ffffff; }
 html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui, -apple-system, Segoe UI, Roboto, Arial;}
-.article{max-width:860px;margin:24px auto;padding:24px;}
+.article{max-width:880px;margin:24px auto;padding:24px;}
 h1,h2,h3{line-height:1.25;margin:18px 0 10px;}
 h1{font-size:26px} h2{font-size:22px} h3{font-size:18px}
 p,li{color:#1d2430}
 ul,ol{padding-left:22px}
 .card{background:#fff;border:1px solid #e8edf3;border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 1px 2px rgba(16,24,40,.03)}
-.badge{display:inline-block;padding:4px 10px;border-radius:999px;background:#eef4ff;color:#1b4dff;font-weight:600;font-size:12px}
 a{color:var(--brand);text-decoration:none}
 a:hover{text-decoration:underline}
-table{border-collapse:collapse;width:100%;margin:10px 0;border:1px solid #e8edf3}
-th,td{border:1px solid #e8edf3;padding:10px;text-align:left}
-.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:var(--muted)}
 hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
+.badge{display:inline-block;padding:4px 10px;border-radius:999px;background:#eef4ff;color:#1b4dff;font-weight:600;font-size:12px}
+.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:var(--muted)}
 </style>"""
         html = f"""<!doctype html>
 <html lang="es">
@@ -1869,28 +1919,16 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
 </body></html>"""
         return html
 
-    def _render_error_html(title: str, subtitle: str, detail: str = "") -> str:
-        body = f"""
-<h2>⚠️ {title}</h2>
-<p class="mono">{subtitle}</p>
-{('<pre class="card mono">'+(detail or '').replace('<','&lt;')+'</pre>') if detail else ''}
-"""
-        return _ensure_html(body, title="Error")
-
-    # ------------- Config & Client -------------
-    api_key = os.getenv("OPENAI_API_KEY")
-    project = os.getenv("OPENAI_PROJECT")
+    # ---------- Client ----------
+    api_key = os.getenv("OPENAI_API_KEY"); project = os.getenv("OPENAI_PROJECT")
     if not api_key:
-        html = _render_error_html("Falta OPENAI_API_KEY", "Configura tu variable de entorno OPENAI_API_KEY.")
-        return Response(html, mimetype="text/html")
-
+        return Response(_ensure_html("<h2>⚠️ Falta OPENAI_API_KEY</h2>"), mimetype="text/html")
     try:
         client = OpenAI(api_key=api_key, project=project)
     except Exception as e:
-        html = _render_error_html("No se pudo crear cliente OpenAI", str(e))
-        return Response(html, mimetype="text/html")
+        return Response(_ensure_html(f"<h2>⚠️ No se pudo crear cliente OpenAI</h2><pre class='mono'>{e}</pre>"), mimetype="text/html")
 
-    # ------------- Params -------------
+    # ---------- Params ----------
     q = (request.args.get("q") or "como registrar una marca en ecuador").strip()
     model = (request.args.get("model") or "gpt-5").strip()
     preview = request.args.get("preview") == "1"
@@ -1899,27 +1937,32 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
     except Exception:
         max_out = 1600
 
-    # ------------- Prompt Persona -------------
+    # ---------- Persona/Plantilla (alta calidad, adaptable) ----------
     SYSTEM = (
-        "Eres un ASESOR EJECUTIVO para gerentes en Ecuador y LATAM. "
-        "Devuelves SIEMPRE **HTML válido** (no Markdown, no backticks). "
-        "Respuesta de ALTÍSIMA calidad, directa ('answer-first') y accionable. "
-        "Si usas Web Search, tope ≤7 búsquedas; prioriza dominios oficiales/reguladores y fuentes confiables. "
-        "Estructura recomendada (adáptala al caso): "
-        "<h2>🧭 Respuesta ejecutiva</h2> bullets; "
-        "<h2>Decisiones y alternativas</h2> pros/cons; "
-        "<h2>Plan 30-60-90</h2>; "
-        "<h2>Costos/ROI (si aplica)</h2>; "
-        "<h2>Riesgos & Compliance</h2> (normas/autoridades); "
-        "<h2>KPIs & Checklist</h2>; "
-        "<h2>📚 Fuentes consultadas</h2> (5–7 enlaces, dominios únicos) "
-        "<h2>🔎 Búsquedas realizadas (≤7)</h2> (query + URL principal, si existe). "
-        "Nunca inventes montos/plazos/leyes; si faltan datos precisos, usa '—' y explica cómo obtenerlos."
+        "Eres un ASESOR EJECUTIVO jurídico/negocios para gerentes en Ecuador y LATAM. "
+        "Devuelves SIEMPRE HTML válido (no Markdown, sin backticks). "
+        "Usas Web Search solo si ayuda (tope ≤7), con preferencia por dominios oficiales y fuentes primarias. "
+        "Reglas de contenido:\n"
+        "• Respuesta 'answer-first' y accionable; español claro.\n"
+        "• Si el tema es **trámite/ley**: incluye <h2>Costos y tasas</h2> y <h2>Plazos</h2> con montos/fechas SOLO si constan en fuentes oficiales; si no, '—'.\n"
+        "• Si el tema es **estratégico/negocio**: incluye <h2>Decisiones y alternativas</h2> y <h2>Plan 30-60-90</h2>.\n"
+        "• Siempre agrega <h2>📚 Fuentes consultadas</h2> con 5–7 enlaces únicos (preferir .gob.ec / reguladores / OMPI, etc.).\n"
+        "• Cierra con <h2>🔎 Búsquedas realizadas (≤7)</h2> listando cada query y URL principal si la hay.\n"
+        "• No inventes plazos/montos. Si no hay dato oficial claro, usa '—' y explica cómo verificar.\n"
+        "• El texto final debe ser un solo bloque HTML (no termines en tool-call)."
     )
     USER = (
-        f"Pregunta del gerente: {q}\n"
-        "Entrega SOLO HTML. No incluyas explicaciones fuera del HTML. "
-        "Usa listas, tablas y subtítulos cuando ayuden a decidir."
+        f"Tarea: Redacta un informe ejecutivo para el/la gerente sobre: {q}\n"
+        "Formato recomendado (adáptalo según el tema):\n"
+        "<h2>🧭 Resumen rápido</h2>\n"
+        "<h2>Pasos / Decisiones y alternativas</h2>\n"
+        "<h2>Costos y tasas</h2>\n"
+        "<h2>Plazos</h2>\n"
+        "<h2>Riesgos & Compliance</h2>\n"
+        "<h2>KPIs & Checklist</h2>\n"
+        "<h2>📚 Fuentes consultadas</h2>\n"
+        "<h2>🔎 Búsquedas realizadas (≤7)</h2>\n"
+        "Incluye listas con <ul><li>…</li></ul> y enlaces clicables <a href='...'>…</a>."
     )
     tool = {"type": "web_search_preview"} if preview else {"type": "web_search"}
 
@@ -1930,31 +1973,28 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "max_output_tokens": max_out  # No usar temperature/top_p en este modelo
+        "max_output_tokens": max_out  # No pasar temperature/top_p en este modelo
     }
 
-    # ------------- Llamada principal (con Web Search) -------------
+    # ---------- Call 1: con Web Search ----------
     try:
         r = client.responses.create(**req)
     except Exception as e:
-        # Error fatal de la llamada
         tb = "\n".join(traceback.format_exc().splitlines()[-6:])
-        detail = f"{e}\n\n{tb}"
-        html = _render_error_html("Fallo en Responses API (principal)", str(e), detail)
-        return Response(html, mimetype="text/html")
+        return Response(_ensure_html(f"<h2>⚠️ Error en Responses API</h2><pre class='mono'>{e}\n{tb}</pre>"), mimetype="text/html")
 
+    # Texto bruto
     text = _safe_text(r)
     text = _strip_tracking_params_in_text(text)
 
-    # ------------- Fallback SIN herramientas (forzar HTML) -------------
+    # Si quedó vacío (tool-call), forzar cierre sin herramientas
     if not text:
         finalize_req = {
             "model": model,
             "input": [
                 {"role": "system",
-                 "content": ("Ahora debes ENTREGAR la respuesta final en **HTML válido**, "
-                             "clara y 'answer-first' (máx 600 palabras), SIN usar herramientas. "
-                             "No devuelvas Markdown ni backticks.")},
+                 "content": ("Entrega AHORA la respuesta final en HTML válido, clara y 'answer-first' (máx 700 palabras), "
+                             "SIN usar herramientas. Agrega '📚 Fuentes consultadas' y '🔎 Búsquedas realizadas (≤7)'.")},
                 {"role": "user", "content": USER},
             ],
             "max_output_tokens": max_out
@@ -1964,14 +2004,26 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
             text = _safe_text(r2)
             text = _strip_tracking_params_in_text(text)
         except Exception as e:
-            html = _render_error_html("Fallo en cierre forzado", str(e))
-            return Response(html, mimetype="text/html")
+            return Response(_ensure_html(f"<h2>⚠️ Fallback falló</h2><pre class='mono'>{e}</pre>"), mimetype="text/html")
 
-    # ------------- Asegurar HTML y responder -------------
-    html_body = text if _looks_html(text) else _markdownish_to_html(text)
-    full_html = _ensure_html(html_body, title="Asesor Ejecutivo")
+    # ---------- Enriquecimiento: insertar búsquedas si faltan ----------
+    def _has_busquedas_section(html: str) -> bool:
+        return bool(re.search(r"b(us|ús)quedas\s+realizadas", html, re.I))
+
+    if not _has_busquedas_section(text):
+        # reconstruye queries y agrega sección al final
+        queries = _extract_tool_queries(r)
+        if queries:
+            items = "\n".join([f"<li><strong>query:</strong> {q} <span class='mono'>| URL principal: —</span></li>" for q in queries])
+            extra = f"\n<h2>🔎 Búsquedas realizadas (≤7)</h2>\n<ul>\n{items}\n</ul>\n"
+            text = text.rstrip() + ("\n" if not text.endswith("\n") else "") + extra
+
+    # ---------- Asegurar HTML + estilos y responder ----------
+    body_html = text if _looks_html(text) else _markdownish_to_html(text)
+    full_html = _ensure_html(body_html, title="Asesor Ejecutivo")
 
     return Response(full_html, mimetype="text/html")
+
 
 
 if __name__ == "__main__":
