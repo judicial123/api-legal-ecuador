@@ -1720,7 +1720,16 @@ def responses_toolcheck():
 
 
 
-@app.route("/responses/toolcheckLast", methods=["GET"])
+
+
+
+    # ===== MODO CONTROL (baseline + SRI) tal cual lo tenías =====
+    # ... (deja aquí tu bloque de modo control sin cambios) ...
+
+
+
+
+@app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
     """
     /responses/toolcheck
@@ -1963,15 +1972,6 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
     full_html = _ensure_html(html_body, title="Asesor Ejecutivo")
 
     return Response(full_html, mimetype="text/html")
-
-
-
-    # ===== MODO CONTROL (baseline + SRI) tal cual lo tenías =====
-    # ... (deja aquí tu bloque de modo control sin cambios) ...
-
-
-
-
 
 
 if __name__ == "__main__":
