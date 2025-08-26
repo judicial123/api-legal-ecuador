@@ -1450,25 +1450,113 @@ def test_contexto_practico():
 # ============= probar 5 =============
 import time
 
-@app.route("/responses/toolcheck2", methods=["GET"])
+@app.route("/responses/toolcheck3", methods=["GET"])
 def responses_toolcheck():
     """
-    Minimal: llama a GPT-5 con Web Search y responde a:
-    'como registrar una marca en ecuador'.
+    Web Search con diagnóstico completo:
+    - Si el modelo produce texto -> ok:true + text
+    - Si hay errores 'silenciosos' -> ok:false + detected_errors
+    - Si es FATAL -> ok:false + fatal:true (no intenta fallback)
+    - Si no hay texto y no es fatal -> intenta fallback SIN herramientas
 
-    - GET ?q=... para cambiar la pregunta.
-    - GET ?preview=1 para usar web_search_preview.
-    - GET ?model=gpt-5 (por defecto) u otro compatible.
-    - GET ?max=1600 (tokens de salida aprox).
-
-    Devuelve JSON con:
-      ok, text (respuesta markdown), model_used, usage, error (si aplica).
+    Params:
+      ?q=...        Pregunta (default: 'como registrar una marca en ecuador')
+      ?preview=1    Usa web_search_preview
+      ?model=gpt-5  Modelo (default gpt-5)
+      ?max=1600     Tokens de salida aprox
+      ?strict=1     Trata cualquier error detectado como fatal
     """
-    import os, traceback
+    import os, json, re, traceback
     from flask import jsonify, request
     from openai import OpenAI
 
-    # --- Config básica ---
+    # ---------- Helpers ----------
+    def _safe_text(resp):
+        try:
+            txt = (getattr(resp, "output_text", "") or "").strip()
+            if txt:
+                return txt
+        except Exception:
+            pass
+        parts = []
+        try:
+            for it in (getattr(resp, "output", []) or []):
+                if (getattr(it, "type", "") or "").lower() == "message":
+                    for c in (getattr(it, "content", []) or []):
+                        t = getattr(c, "text", None)
+                        if t:
+                            parts.append(t)
+        except Exception:
+            pass
+        return "\n".join([p for p in parts if p]).strip()
+
+    def _resp_to_dict(resp):
+        for attr in ("model_dump_json", "json"):
+            fn = getattr(resp, attr, None)
+            if callable(fn):
+                try:
+                    return json.loads(fn())
+                except Exception:
+                    pass
+        try:
+            d = {}
+            for k, v in resp.__dict__.items():
+                try:
+                    json.dumps(v); d[k] = v
+                except Exception:
+                    d[k] = str(v)
+            return d
+        except Exception:
+            return {"_raw": str(resp)}
+
+    def _find_errors_anywhere(obj, path="$", out=None):
+        if out is None: out = []
+        try:
+            if isinstance(obj, dict):
+                if "error" in obj and obj["error"]:
+                    out.append({"path": path + ".error", "snippet": obj["error"]})
+                if "status" in obj:
+                    st = str(obj["status"]).lower()
+                    if st not in ("completed","success","ok","finished","done"):
+                        out.append({"path": path + ".status", "snippet": obj["status"]})
+                if "message" in obj and isinstance(obj["message"], str) and "error" in obj["message"].lower():
+                    out.append({"path": path + ".message", "snippet": obj["message"]})
+                if "type" in obj and isinstance(obj["type"], str) and "error" in obj["type"].lower():
+                    out.append({"path": path + ".type", "snippet": obj["type"]})
+                for k, v in obj.items():
+                    _find_errors_anywhere(v, f"{path}.{k}", out)
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj):
+                    _find_errors_anywhere(v, f"{path}[{i}]", out)
+        except Exception:
+            pass
+        return out
+
+    def _classify_fatal(detected_errors, raw_status, strict=False):
+        """
+        Heurística: decide si es 'fatal' y si es 'retryable'.
+        """
+        if strict and detected_errors:
+            return True, True, "strict_mode_error"
+
+        # status global anómalo
+        rs = (str(raw_status).lower() if raw_status is not None else "")
+        if rs in ("failed","error","timeout","cancelled"):
+            return True, True, f"status={rs}"
+
+        # palabras clave en snippets
+        retryable_keys = ("timeout","temporarily","unavailable","gateway","internal","server","try again","rate limit","429")
+        nonretry_keys = ("invalid api key","authentication","permission","forbidden","insufficient_quota","quota exceeded","payment","billing","bad request")
+        fatal = False; retryable = True; reason = None
+        for e in detected_errors:
+            snip = str(e.get("snippet","")).lower()
+            if any(k in snip for k in nonretry_keys):
+                return True, False, snip[:200]
+            if any(k in snip for k in retryable_keys):
+                fatal = True; retryable = True; reason = snip[:200]
+        return (fatal, retryable, reason or ("status="+rs if rs else None))
+
+    # ---------- Configuración ----------
     api_key = os.getenv("OPENAI_API_KEY")
     project = os.getenv("OPENAI_PROJECT")
     if not api_key:
@@ -1477,12 +1565,13 @@ def responses_toolcheck():
     try:
         client = OpenAI(api_key=api_key, project=project)
     except Exception as e:
-        return jsonify({"ok": False, "error": f"No se pudo crear cliente OpenAI: {e}"}), 200
+        return jsonify({"ok": False, "fatal": True, "retryable": False, "error": f"No se pudo crear cliente OpenAI: {e}"}), 200
 
-    # --- Params ---
+    # ---------- Parámetros ----------
     q = (request.args.get("q") or "como registrar una marca en ecuador").strip()
     model = (request.args.get("model") or "gpt-5").strip()
     preview = request.args.get("preview") == "1"
+    strict = request.args.get("strict") == "1"
     try:
         max_out = int(request.args.get("max", "1600"))
     except Exception:
@@ -1490,8 +1579,8 @@ def responses_toolcheck():
 
     SYSTEM = (
         "Responde de forma clara y answer-first en máximo 600 palabras. "
-        "Puedes usar búsquedas web (≤7) y prioriza fuentes oficiales .gob.ec/SENADI. "
-        "Siempre emite un mensaje final; no termines en una llamada de herramienta."
+        "Puedes usar búsquedas web (≤7) y prioriza .gob.ec/SENADI. "
+        "Siempre emite un mensaje final de texto; no termines en una llamada de herramienta."
     )
     USER = q
     tool = {"type": "web_search_preview"} if preview else {"type": "web_search"}
@@ -1503,20 +1592,19 @@ def responses_toolcheck():
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "max_output_tokens": max_out  # no pases 'temperature' con gpt-5 en Responses
+        "response_format": {"type": "text"},
+        "max_output_tokens": max_out
     }
 
-    # --- Llamada principal (con Web Search) ---
+    # ---------- Llamada principal ----------
     try:
         r = client.responses.create(**req)
     except Exception as e:
         err = {"message": str(e)}
         resp = getattr(e, "response", None)
         if resp is not None:
-            try:
-                body = resp.json()
-            except Exception:
-                body = getattr(resp, "text", None)
+            try: body = resp.json()
+            except Exception: body = getattr(resp, "text", None)
             headers = getattr(resp, "headers", {}) or {}
             err.update({
                 "status_code": getattr(resp, "status_code", None),
@@ -1527,51 +1615,80 @@ def responses_toolcheck():
             err["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
         except Exception:
             pass
-        return jsonify({"ok": False, "error": err, "request_payload": req}), 200
+        return jsonify({"ok": False, "fatal": True, "retryable": True, "error": err, "request_payload": req}), 200
 
-    text = (getattr(r, "output_text", "") or "").strip()
+    text = _safe_text(r)
+    r_dict = _resp_to_dict(r)
+    detected_errors = _find_errors_anywhere(r_dict)
+    raw_status = r_dict.get("status")
 
-    # --- Fallback simple: si quedó vacío (p.ej. terminó en tool-call), forzar cierre sin herramientas ---
+    # ¿Errores fatales dentro de la respuesta?
+    is_fatal, retryable, reason = _classify_fatal(detected_errors, raw_status, strict=strict)
+    if is_fatal:
+        usage = getattr(r, "usage", None)
+        usage_dict = {
+            "input_tokens": getattr(usage, "input_tokens", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+        } if usage else None
+        return jsonify({
+            "ok": False,
+            "fatal": True,
+            "retryable": retryable,
+            "reason": reason,
+            "text": text or "",
+            "model_used": getattr(r, "model", model),
+            "used_preview": preview,
+            "usage": usage_dict,
+            "detected_errors": detected_errors,
+            "raw_status": raw_status,
+            "request_payload": req
+        }), 200
+
+    # Si no hay texto y no es fatal -> fallback SIN herramientas
     if not text:
         finalize_req = {
             "model": model,
             "input": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Entrega una respuesta final, clara y answer-first (máx 600 palabras), "
-                        "sin usar herramientas. Si algo no es exacto, sé conservador."
-                    ),
-                },
+                {"role": "system",
+                 "content": ("Ahora debes ENTREGAR la respuesta final, clara y answer-first (máx 600 palabras), "
+                             "SIN usar herramientas. Escribe texto llano en Markdown. No agregues nada más.")},
                 {"role": "user", "content": USER},
             ],
+            "response_format": {"type": "text"},
             "max_output_tokens": max_out
         }
         try:
             r2 = client.responses.create(**finalize_req)
-            text = (getattr(r2, "output_text", "") or "").strip()
+            text2 = _safe_text(r2)
+            r2_dict = _resp_to_dict(r2)
+            detected_errors2 = _find_errors_anywhere(r2_dict)
+            raw_status2 = r2_dict.get("status")
+            is_fatal2, retryable2, reason2 = _classify_fatal(detected_errors2, raw_status2, strict=strict)
             usage = getattr(r2, "usage", None)
             usage_dict = {
                 "input_tokens": getattr(usage, "input_tokens", None),
                 "output_tokens": getattr(usage, "output_tokens", None),
             } if usage else None
             return jsonify({
-                "ok": bool(text),
-                "text": text,
+                "ok": bool(text2) and not is_fatal2,
+                "fatal": bool(is_fatal2),
+                "retryable": False if is_fatal2 and not retryable2 else True,
+                "reason": reason2,
+                "text": (text2 or ""),
                 "model_used": getattr(r2, "model", model),
                 "used_preview": preview,
                 "finalized_fallback": True,
                 "usage": usage_dict,
+                "detected_errors": detected_errors2,
+                "raw_status": raw_status2,
                 "request_payload": req
             }), 200
         except Exception as e:
             err = {"message": str(e)}
             resp = getattr(e, "response", None)
             if resp is not None:
-                try:
-                    body = resp.json()
-                except Exception:
-                    body = getattr(resp, "text", None)
+                try: body = resp.json()
+                except Exception: body = getattr(resp, "text", None)
                 headers = getattr(resp, "headers", {}) or {}
                 err.update({
                     "status_code": getattr(resp, "status_code", None),
@@ -1582,14 +1699,11 @@ def responses_toolcheck():
                 err["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
             except Exception:
                 pass
-            return jsonify({
-                "ok": False,
-                "error": err,
-                "note": "Falló la llamada principal y el cierre forzado.",
-                "request_payload": req
-            }), 200
+            return jsonify({"ok": False, "fatal": True, "retryable": True,
+                            "error": err, "note": "Falló la llamada principal y el cierre forzado.",
+                            "request_payload": req}), 200
 
-    # --- Respuesta normal (sí hubo texto) ---
+    # Respuesta normal
     usage = getattr(r, "usage", None)
     usage_dict = {
         "input_tokens": getattr(usage, "input_tokens", None),
@@ -1598,12 +1712,16 @@ def responses_toolcheck():
 
     return jsonify({
         "ok": True,
+        "fatal": False,
         "text": text,
         "model_used": getattr(r, "model", model),
         "used_preview": preview,
         "usage": usage_dict,
+        "detected_errors": detected_errors,   # pueden ser warnings no fatales
+        "raw_status": raw_status,
         "request_payload": req
     }), 200
+
 
 
 
