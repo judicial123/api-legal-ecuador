@@ -2044,7 +2044,6 @@ def test_marca_simple():
         return Response("<h3>⚠️ Falta OPENAI_API_KEY</h3>", mimetype="text/html; charset=utf-8")
     client = OpenAI(api_key=api_key, project=os.getenv("OPENAI_PROJECT"))
 
-    # PROMPT enfocado + obligación de cerrar con respuesta final
     SYSTEM = (
         "Eres asesor del SENADI. Responde en **HTML simple** (sin <html>/<body>) "
         "de forma directiva y ejecutiva. Usa H2 para secciones y bullets. "
@@ -2066,7 +2065,6 @@ def test_marca_simple():
         "Reglas: bullets breves; solo pasos, tiempos y dinero; enlaces clicables."
     )
 
-    # ✅ Usar web_search simple
     tools = [{"type": "web_search"}]
 
     req = {
@@ -2076,8 +2074,7 @@ def test_marca_simple():
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "temperature": 0,       # sin creatividad
-        "tool_choice": "auto",  # deja que el modelo llame web_search
+        "tool_choice": "auto",
         "max_output_tokens": 900
     }
 
@@ -2090,7 +2087,6 @@ def test_marca_simple():
     qs = _queries(resp)
 
     if not html_out:
-        # Si no llega texto final, mostramos JSON de diagnóstico
         raw = html.escape(getattr(resp, "model_dump_json", lambda: "{}")())
         html_out = (
             "<p>No se obtuvo respuesta final del modelo.</p>"
