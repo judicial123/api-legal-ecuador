@@ -1730,7 +1730,7 @@ def responses_toolcheck():
 
 
 @app.route("/responses/toolcheckFinal", methods=["GET"])
-def responses_toolcheck():
+def responses_toolcheckFinal():
     """
     /responses/toolcheck
     - Responde en HTML (text/html) para cualquier pregunta gerencial (?q=...).
