@@ -1450,7 +1450,7 @@ def test_contexto_practico():
 # ============= probar 5 =============
 import time
 # --- GET /responses/testMarca (ultra-minimal mejorado: más aire) ---
-# --- GET /responses/testMarca (ultra-minimal mejorado: más aire) ---
+# --- GET /responses/testMarca (ultra-minimal mejorado: aún más aire) ---
 app.view_functions.pop("responses_testMarca", None)
 
 @app.route("/responses/testMarca", methods=["GET"])
@@ -1547,7 +1547,7 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px so
         "No inventes montos/plazos; si no constan oficialmente, usa '—' y explica cómo verificar en el sitio."
     )
 
-    # MÁS AIRE: subimos el límite principal
+    # AIRE MUY AMPLIO
     req = {
         "model": "gpt-5",
         "tools": [{"type": "web_search"}],
@@ -1555,7 +1555,7 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px so
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "max_output_tokens": 3600  # ⬅️ antes 1600 / 2800
+        "max_output_tokens": 7200  # ⬅️ el doble (o más) que antes
     }
 
     # llamada principal
@@ -1565,14 +1565,14 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px so
         text = _safe_text(r)
         text = _strip_tracking(text)
         if not text or not text.strip():
-            # fallback sin herramientas — MÁS AIRE también
+            # fallback sin herramientas — también con más aire
             r2 = client.responses.create(
                 model="gpt-5",
                 input=[
-                    {"role":"system","content":"Entrega AHORA la respuesta final en HTML válido (máx 1300 palabras), SIN usar herramientas, con las secciones pedidas."},
+                    {"role":"system","content":"Entrega AHORA la respuesta final en HTML válido (máx 1500 palabras), SIN usar herramientas, con las secciones pedidas."},
                     {"role":"user","content": USER},
                 ],
-                max_output_tokens=2000  # ⬅️ antes 900/1600
+                max_output_tokens=4000  # ⬅️ aumentado
             )
             text = _safe_text(r2)
             text = _strip_tracking(text)
@@ -1605,8 +1605,6 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px so
 
     body = banner_body + text
     return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
-
-
 
 # Evita colisión si ya existía
 app.view_functions.pop("responses_toolcheckFinal", None)
