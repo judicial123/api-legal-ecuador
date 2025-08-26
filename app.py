@@ -1967,27 +1967,91 @@ def _queries(resp):
             uniq.append(q)
     return uniq
 
+# app_test_marca_simple.py  (versión corregida)
+from flask import Flask, Response, request
+from openai import OpenAI
+import os, html, json, time
+
+app = Flask(__name__)
+
+def _safe_text(resp):
+    # Intenta obtener el texto final sin pelearse con la estructura del Responses API
+    try:
+        t = (getattr(resp, "output_text", "") or "").strip()
+        if t:
+            return t
+    except Exception:
+        pass
+    parts = []
+    try:
+        for it in (getattr(resp, "output", []) or []):
+            if (getattr(it, "type", "") or "").lower() == "message":
+                for c in (getattr(it, "content", []) or []):
+                    tx = getattr(c, "text", None)
+                    if tx:
+                        parts.append(tx)
+    except Exception:
+        pass
+    return "\n".join(parts).strip()
+
+def _resp_json(resp):
+    try:
+        return json.loads(getattr(resp, "model_dump_json", lambda: "{}")())
+    except Exception:
+        return {}
+
+def _usage(resp):
+    d = _resp_json(resp)
+    u = d.get("usage", {}) or {}
+    return {
+        "in": int(u.get("input_tokens") or 0),
+        "out": int(u.get("output_tokens") or 0),
+        "total": int(u.get("total_tokens") or ((u.get("input_tokens") or 0) + (u.get("output_tokens") or 0))),
+        "cached": int(((u.get("input_tokens_details") or {}).get("cached_tokens")) or 0),
+    }
+
+def _queries(resp):
+    d = _resp_json(resp)
+    out = []
+    for item in d.get("output", []) or []:
+        t = (item.get("type","") or "").lower()
+        # El Responses API etiqueta el websearch como "web.search" internamente;
+        # buscamos cualquier *call* al web search y extraemos la query si viene en arguments/tool_input
+        if "web" in t and "search" in t and "call" in t:
+            args = item.get("arguments") or item.get("tool_input") or {}
+            q = None
+            for k in ("q","query","search_query"):
+                if isinstance(args.get(k), str) and args.get(k).strip():
+                    q = args.get(k).strip()
+                    break
+            if q:
+                out.append(q)
+    # único
+    seen, uniq = set(), []
+    for q in out:
+        k = q.lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(q)
+    return uniq
+
 @app.route("/responses/testMarcaSimple", methods=["GET"])
 def test_marca_simple():
-    # Parámetros mínimos
     pregunta = (request.args.get("q") or "¿Cómo registrar una marca?").strip()
 
-    # Cliente
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return Response("<h3>⚠️ Falta OPENAI_API_KEY</h3>", mimetype="text/html; charset=utf-8")
     client = OpenAI(api_key=api_key, project=os.getenv("OPENAI_PROJECT"))
 
-    # Prompts súper enfocados
+    # PROMPT enfocado + obligación de cerrar con respuesta final
     SYSTEM = (
-        "Eres un asesor del SENADI. Responde en **HTML simple** (sin <html>/<body>) "
-        "de forma directiva y ejecutiva. "
-        "Usa H2 para secciones y bullets cortos. "
-        "Prohibido inventar: si un dato (costo/plazo) no está claro en la fuente oficial, pon '—' y añade 'Cómo verificar' "
-        "indicando la ruta exacta en el sitio. "
-        "Limítate SOLO a: PASOS, PLAZOS y DINERO para registrar una marca en Ecuador. "
-        "Usa como **única fuente** la URL indicada por el usuario. "
-        "Haz como máximo 2 búsquedas. Devuelve enlaces clicables."
+        "Eres asesor del SENADI. Responde en **HTML simple** (sin <html>/<body>) "
+        "de forma directiva y ejecutiva. Usa H2 para secciones y bullets. "
+        "Prohibido inventar: si un monto o plazo no consta de la fuente oficial, escribe '—' y añade 'Cómo verificar' "
+        "indicando la ruta exacta en el sitio. Limítate SOLO a PASOS, PLAZOS y DINERO para registrar una marca en Ecuador. "
+        "Usa exclusivamente la URL indicada por el usuario. "
+        "Haz como máximo 3 búsquedas. **Debes concluir con un mensaje final (no termines en tool-call).**"
     )
 
     USER = (
@@ -1999,10 +2063,21 @@ def test_marca_simple():
         "<h2>Costos</h2>\n"
         "<h2>Plazos</h2>\n"
         "<h2>Fuentes</h2>\n"
-        "Reglas: bullets breves, sin adornos; solo pasos, tiempos y dinero."
+        "Reglas: bullets breves; solo pasos, tiempos y dinero; enlaces clicables."
     )
 
-    tools = [{"type": "web_search_preview"}]  # usa el buscador del Responses API
+    # 🔧 CLAVE: usar web_search (no web_search_preview)
+    tools = [
+        {
+            "type": "web_search",
+            # Tip: algunos SDKs aceptan options; si tu versión no, quita "options".
+            "options": {
+                "max_results": 3,
+                "strict": True,
+                "domains": ["www.derechosintelectuales.gob.ec", "derechosintelectuales.gob.ec"]
+            }
+        }
+    ]
 
     req = {
         "model": "gpt-5",
@@ -2011,18 +2086,29 @@ def test_marca_simple():
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "max_output_tokens": 800
+        "temperature": 0,                 # sin creatividad
+        "tool_choice": "auto",            # deja que el modelo llame web_search
+        "max_output_tokens": 900
     }
 
     t0 = time.perf_counter()
     resp = client.responses.create(**req)
     ms = int((time.perf_counter() - t0) * 1000)
 
-    html_out = _safe_text(resp).strip() or "<p>No se obtuvo respuesta.</p>"
+    html_out = _safe_text(resp).strip()
     use = _usage(resp)
     qs = _queries(resp)
 
-    # Mini UI básica
+    if not html_out:
+        # Si a pesar de todo no llega texto final, mostramos un fallback con el JSON para diagnóstico rápido
+        raw = html.escape(getattr(resp, "model_dump_json", lambda: "{}")())
+        html_out = (
+            "<p>No se obtuvo respuesta final del modelo.</p>"
+            "<details><summary>Detalles (JSON)</summary>"
+            f"<pre style='white-space:pre-wrap'>{raw}</pre>"
+            "</details>"
+        )
+
     debug_box = f"""
 <div style="margin:12px 0;padding:10px;border:1px solid #e8edf3;border-radius:10px;font:12px ui-monospace,Menlo,Consolas;color:#4b5563;background:#fafbff">
   <div>⏱️ {ms} ms · 🔤 tokens IN/OUT/TOTAL: {use['in']}/{use['out']}/{use['total']} (cached {use['cached']})</div>
