@@ -1729,7 +1729,7 @@ def responses_toolcheck():
 
 
 
-@app.route("/responses/toolcheck", methods=["GET"])
+@app.route("/responses/toolcheckFinal", methods=["GET"])
 def responses_toolcheck():
     """
     /responses/toolcheck
