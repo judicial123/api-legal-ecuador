@@ -1450,14 +1450,13 @@ def test_contexto_practico():
 # ============= probar 5 =============
 import time
 
-@app.route("/responses/toolcheck3", methods=["GET"])
+@app.route("/responses/toolcheck", methods=["GET"])
 def responses_toolcheck():
     """
-    Web Search con diagnóstico completo:
-    - Si el modelo produce texto -> ok:true + text
-    - Si hay errores 'silenciosos' -> ok:false + detected_errors
-    - Si es FATAL -> ok:false + fatal:true (no intenta fallback)
-    - Si no hay texto y no es fatal -> intenta fallback SIN herramientas
+    Web Search con diagnóstico:
+    - Llama a GPT-5 con Web Search para responder 'como registrar una marca en ecuador' (o ?q=...).
+    - Si el modelo no produce texto (ej. se quedó en tool-calls), intenta un fallback SIN herramientas.
+    - Reporta errores fatales/no fatales detectados dentro del objeto de respuesta.
 
     Params:
       ?q=...        Pregunta (default: 'como registrar una marca en ecuador')
@@ -1472,6 +1471,7 @@ def responses_toolcheck():
 
     # ---------- Helpers ----------
     def _safe_text(resp):
+        """Extrae texto aunque output_text venga vacío."""
         try:
             txt = (getattr(resp, "output_text", "") or "").strip()
             if txt:
@@ -1491,6 +1491,7 @@ def responses_toolcheck():
         return "\n".join([p for p in parts if p]).strip()
 
     def _resp_to_dict(resp):
+        """Convierte el objeto Response a dict si el SDK lo permite (para inspección)."""
         for attr in ("model_dump_json", "json"):
             fn = getattr(resp, attr, None)
             if callable(fn):
@@ -1510,6 +1511,7 @@ def responses_toolcheck():
             return {"_raw": str(resp)}
 
     def _find_errors_anywhere(obj, path="$", out=None):
+        """Busca señales de error en todo el árbol (tool errors, status, 'error', etc.)."""
         if out is None: out = []
         try:
             if isinstance(obj, dict):
@@ -1533,18 +1535,12 @@ def responses_toolcheck():
         return out
 
     def _classify_fatal(detected_errors, raw_status, strict=False):
-        """
-        Heurística: decide si es 'fatal' y si es 'retryable'.
-        """
+        """Heurística para marcar fatal/retryable."""
         if strict and detected_errors:
             return True, True, "strict_mode_error"
-
-        # status global anómalo
         rs = (str(raw_status).lower() if raw_status is not None else "")
         if rs in ("failed","error","timeout","cancelled"):
             return True, True, f"status={rs}"
-
-        # palabras clave en snippets
         retryable_keys = ("timeout","temporarily","unavailable","gateway","internal","server","try again","rate limit","429")
         nonretry_keys = ("invalid api key","authentication","permission","forbidden","insufficient_quota","quota exceeded","payment","billing","bad request")
         fatal = False; retryable = True; reason = None
@@ -1560,7 +1556,7 @@ def responses_toolcheck():
     api_key = os.getenv("OPENAI_API_KEY")
     project = os.getenv("OPENAI_PROJECT")
     if not api_key:
-        return jsonify({"ok": False, "error": "Falta OPENAI_API_KEY"}), 200
+        return jsonify({"ok": False, "fatal": True, "retryable": False, "error": "Falta OPENAI_API_KEY"}), 200
 
     try:
         client = OpenAI(api_key=api_key, project=project)
@@ -1592,8 +1588,7 @@ def responses_toolcheck():
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "response_format": {"type": "text"},
-        "max_output_tokens": max_out
+        "max_output_tokens": max_out  # OJO: sin 'response_format' y sin 'temperature'
     }
 
     # ---------- Llamada principal ----------
@@ -1644,7 +1639,7 @@ def responses_toolcheck():
             "request_payload": req
         }), 200
 
-    # Si no hay texto y no es fatal -> fallback SIN herramientas
+    # ---------- Fallback SIN herramientas si no hubo texto y no es fatal ----------
     if not text:
         finalize_req = {
             "model": model,
@@ -1654,7 +1649,6 @@ def responses_toolcheck():
                              "SIN usar herramientas. Escribe texto llano en Markdown. No agregues nada más.")},
                 {"role": "user", "content": USER},
             ],
-            "response_format": {"type": "text"},
             "max_output_tokens": max_out
         }
         try:
@@ -1699,11 +1693,13 @@ def responses_toolcheck():
                 err["traceback_tail"] = traceback.format_exc().splitlines()[-6:]
             except Exception:
                 pass
-            return jsonify({"ok": False, "fatal": True, "retryable": True,
-                            "error": err, "note": "Falló la llamada principal y el cierre forzado.",
-                            "request_payload": req}), 200
+            return jsonify({
+                "ok": False, "fatal": True, "retryable": True,
+                "error": err, "note": "Falló la llamada principal y el cierre forzado.",
+                "request_payload": req
+            }), 200
 
-    # Respuesta normal
+    # ---------- Respuesta normal ----------
     usage = getattr(r, "usage", None)
     usage_dict = {
         "input_tokens": getattr(usage, "input_tokens", None),
@@ -1721,6 +1717,7 @@ def responses_toolcheck():
         "raw_status": raw_status,
         "request_payload": req
     }), 200
+
 
 
 
