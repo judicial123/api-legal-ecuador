@@ -2037,77 +2037,80 @@ def _queries(resp):
 
 @app.route("/responses/testMarcaSimple", methods=["GET"])
 def test_marca_simple():
-    pregunta = (request.args.get("q") or "¿Cómo registrar una marca?").strip()
+    from flask import request, Response
+    import os, json, re, html
+    from openai import OpenAI
+    import time
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return Response("<h3>⚠️ Falta OPENAI_API_KEY</h3>", mimetype="text/html; charset=utf-8")
+        return Response("<h3>⚠️ Falta OPENAI_API_KEY</h3>", mimetype="text/html")
     client = OpenAI(api_key=api_key, project=os.getenv("OPENAI_PROJECT"))
 
+    q = (request.args.get("q") or "como registrar una marca en ecuador").strip()
+
     SYSTEM = (
-        "Eres asesor del SENADI. Responde en **HTML simple** (sin <html>/<body>) "
-        "de forma directiva y ejecutiva. Usa H2 para secciones y bullets. "
-        "Prohibido inventar: si un monto o plazo no consta de la fuente oficial, escribe '—' y añade 'Cómo verificar' "
-        "indicando la ruta exacta en el sitio. Limítate SOLO a PASOS, PLAZOS y DINERO para registrar una marca en Ecuador. "
+        "Eres asesor del SENADI. Responde en HTML simple (sin <html>/<body>). "
+        "Obligatorio: secciones <h2>🧭 Resumen</h2>, <h2>Pasos oficiales</h2>, "
+        "<h2>Costos</h2>, <h2>Plazos</h2>, <h2>Fuentes</h2>. "
+        "Prohibido inventar: si no hay monto/plazo oficial, pon '—' y añade 'Cómo verificar'. "
         "Usa exclusivamente la URL indicada por el usuario. "
-        "Haz como máximo 3 búsquedas. **Debes concluir con un mensaje final (no termines en tool-call).**"
+        "Nunca termines en tool-call: entrega texto final."
     )
 
     USER = (
-        "Pregunta gerencial: ¿Cómo registrar una marca en Ecuador?\n"
-        "URL objetivo (única fuente): https://www.derechosintelectuales.gob.ec/como-registro-una-marca/\n\n"
-        "Estructura obligatoria:\n"
-        "<h2>🧭 Resumen</h2>\n"
-        "<h2>Pasos oficiales</h2>\n"
-        "<h2>Costos</h2>\n"
-        "<h2>Plazos</h2>\n"
-        "<h2>Fuentes</h2>\n"
+        f"Pregunta gerencial: {q}\n"
+        "Fuente oficial: https://www.derechosintelectuales.gob.ec/como-registro-una-marca/\n"
         "Reglas: bullets breves; solo pasos, tiempos y dinero; enlaces clicables."
     )
 
-    tools = [{"type": "web_search"}]
-
-    req = {
-        "model": "gpt-5",
-        "tools": tools,
-        "input": [
+    # ---- Paso 1: permitir búsqueda ----
+    r1 = client.responses.create(
+        model="gpt-5",
+        tools=[{"type": "web_search"}],
+        input=[
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "tool_choice": "auto",
-        "max_output_tokens": 900
-    }
+        max_output_tokens=900,
+    )
 
-    t0 = time.perf_counter()
-    resp = client.responses.create(**req)
-    ms = int((time.perf_counter() - t0) * 1000)
+    def _safe_text(resp):
+        try:
+            return (getattr(resp, "output_text", "") or "").strip()
+        except:
+            return ""
 
-    html_out = _safe_text(resp).strip()
-    use = _usage(resp)
-    qs = _queries(resp)
+    def _resp_json(resp):
+        try:
+            return json.loads(getattr(resp, "model_dump_json", lambda: "{}")())
+        except:
+            return {}
 
-    if not html_out:
-        raw = html.escape(getattr(resp, "model_dump_json", lambda: "{}")())
-        html_out = (
-            "<p>No se obtuvo respuesta final del modelo.</p>"
-            "<details><summary>Detalles (JSON)</summary>"
-            f"<pre style='white-space:pre-wrap'>{raw}</pre>"
-            "</details>"
+    text = _safe_text(r1)
+
+    # ---- Paso 2: fallback si quedó vacío ----
+    if not text:
+        r2 = client.responses.create(
+            model="gpt-5",
+            input=[
+                {"role": "system",
+                 "content": SYSTEM + " IMPORTANTE: ahora responde final sin herramientas."},
+                {"role": "user",
+                 "content": USER + "\n\nEntrega YA la respuesta ejecutiva final en HTML."},
+            ],
+            max_output_tokens=900,
         )
+        text = _safe_text(r2) or "<p>No se obtuvo respuesta final.</p>"
 
-    debug_box = f"""
-<div style="margin:12px 0;padding:10px;border:1px solid #e8edf3;border-radius:10px;font:12px ui-monospace,Menlo,Consolas;color:#4b5563;background:#fafbff">
-  <div>⏱️ {ms} ms · 🔤 tokens IN/OUT/TOTAL: {use['in']}/{use['out']}/{use['total']} (cached {use['cached']})</div>
-  <div>🔎 Queries: {"; ".join(html.escape(q) for q in qs) if qs else "—"}</div>
-</div>
-"""
+    # ---- Envolver en HTML sencillo ----
     page = f"""<!doctype html><meta charset="utf-8">
-<div style="max-width:860px;margin:24px auto;padding:0 12px;font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#0b1320">
+<div style="max-width:860px;margin:24px auto;padding:0 12px;font:16px system-ui">
   <h2>Registro de marca (SENADI) — Respuesta ejecutiva</h2>
-  {debug_box}
-  {html_out}
+  {text}
 </div>"""
     return Response(page, mimetype="text/html; charset=utf-8")
+
 
 
 if __name__ == "__main__":
