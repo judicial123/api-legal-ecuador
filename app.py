@@ -1449,8 +1449,6 @@ def test_contexto_practico():
 
 # ============= probar 5 =============
 import time
-# --- GET /responses/testMarca (solo info desde internet, sin contenido hardcodeado) ---
-# --- GET /responses/testMarca (solo web, chequeo flexible) ---
 # --- GET /responses/testMarca (más aire + cierre automático) ---
 app.view_functions.pop("responses_testMarca", None)
 
@@ -1513,7 +1511,7 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
         return len(set(official)) >= 1
 
     def _looks_truncated(html: str) -> bool:
-        if not html: 
+        if not html:
             return True
         if len(re.findall(r"<h2\b", html, re.I)) < 3:
             return True
@@ -1589,7 +1587,7 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
                     {"role":"system","content":"Entrega YA la respuesta final en HTML válido (máx 1200 palabras), SIN usar herramientas, citando solo lo encontrado en las búsquedas previas."},
                     {"role":"user","content": USER},
                 ],
-                "max_output_tokens": 1800
+                max_output_tokens=1800  # FIX: keyword argument correcto
             )
             html = _strip_tracking_urls(_safe_text(r2))
         except Exception as e:
@@ -1646,9 +1644,6 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
 
     return Response(_wrap_html(html), mimetype="text/html; charset=utf-8")
 
-
-    # ===== MODO CONTROL (baseline + SRI) tal cual lo tenías =====
-    # ... (deja aquí tu bloque de modo control sin cambios) ...
 
 
 
