@@ -2038,41 +2038,30 @@ def _queries(resp):
 @app.route("/responses/testMarcaSimple", methods=["GET"])
 def test_marca_simple():
     from flask import request, Response
-    import os, json, re, html
+    import os, json, html, re
     from openai import OpenAI
-    import time
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return Response("<h3>⚠️ Falta OPENAI_API_KEY</h3>", mimetype="text/html")
     client = OpenAI(api_key=api_key, project=os.getenv("OPENAI_PROJECT"))
 
-    q = (request.args.get("q") or "como registrar una marca en ecuador").strip()
-
     SYSTEM = (
-        "Eres asesor del SENADI. Responde en HTML simple (sin <html>/<body>). "
-        "Obligatorio: secciones <h2>🧭 Resumen</h2>, <h2>Pasos oficiales</h2>, "
-        "<h2>Costos</h2>, <h2>Plazos</h2>, <h2>Fuentes</h2>. "
-        "Prohibido inventar: si no hay monto/plazo oficial, pon '—' y añade 'Cómo verificar'. "
-        "Usa exclusivamente la URL indicada por el usuario. "
-        "Nunca termines en tool-call: entrega texto final."
+        "Eres asesor del SENADI. Devuelves SIEMPRE HTML válido (sin <html>/<body>). "
+        "Estructura obligatoria:\n"
+        "<h2>🧭 Resumen</h2>\n"
+        "<h2>Pasos oficiales</h2>\n"
+        "<h2>Costos</h2>\n"
+        "<h2>Plazos</h2>\n"
+        "<h2>Fuentes</h2>\n"
+        "Reglas: bullets breves; solo pasos, tiempos y dinero; enlaces clicables. "
+        "Prohibido inventar: si no hay monto/plazo, escribe '—' y añade 'Cómo verificar'. "
+        "Usa exclusivamente https://www.derechosintelectuales.gob.ec/como-registro-una-marca/. "
+        "Nunca termines en tool-call: siempre entrega HTML final."
     )
-
     USER = (
-        f"Pregunta gerencial: {q}\n"
+        "Pregunta: ¿Cómo registrar una marca en Ecuador?\n"
         "Fuente oficial: https://www.derechosintelectuales.gob.ec/como-registro-una-marca/\n"
-        "Reglas: bullets breves; solo pasos, tiempos y dinero; enlaces clicables."
-    )
-
-    # ---- Paso 1: permitir búsqueda ----
-    r1 = client.responses.create(
-        model="gpt-5",
-        tools=[{"type": "web_search"}],
-        input=[
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": USER},
-        ],
-        max_output_tokens=900,
     )
 
     def _safe_text(resp):
@@ -2087,23 +2076,45 @@ def test_marca_simple():
         except:
             return {}
 
+    # ---- Paso 1: con web_search ----
+    r1 = client.responses.create(
+        model="gpt-5",
+        tools=[{"type": "web_search"}],
+        input=[
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": USER},
+        ],
+        max_output_tokens=800,
+    )
+
     text = _safe_text(r1)
 
-    # ---- Paso 2: fallback si quedó vacío ----
+    # ---- Paso 2: fallback si no hay texto ----
     if not text:
+        j1 = _resp_json(r1)
+        # reconstruir queries usadas (para debug)
+        queries = []
+        for it in j1.get("output", []) or []:
+            if "web" in (it.get("type") or "") and "call" in (it.get("type") or ""):
+                args = it.get("arguments") or {}
+                if isinstance(args, dict) and "query" in args:
+                    queries.append(args["query"])
+        queries_txt = "; ".join(queries) or "—"
+
         r2 = client.responses.create(
             model="gpt-5",
             input=[
                 {"role": "system",
-                 "content": SYSTEM + " IMPORTANTE: ahora responde final sin herramientas."},
+                 "content": SYSTEM + " IMPORTANTE: ahora responde final sin usar herramientas."},
                 {"role": "user",
-                 "content": USER + "\n\nEntrega YA la respuesta ejecutiva final en HTML."},
+                 "content": USER + "\nYa hiciste búsquedas, ahora entrega la respuesta ejecutiva final en HTML."},
             ],
             max_output_tokens=900,
         )
         text = _safe_text(r2) or "<p>No se obtuvo respuesta final.</p>"
+        text += f"<h2>🔎 Búsquedas realizadas</h2><p>{html.escape(queries_txt)}</p>"
 
-    # ---- Envolver en HTML sencillo ----
+    # ---- Envolver ----
     page = f"""<!doctype html><meta charset="utf-8">
 <div style="max-width:860px;margin:24px auto;padding:0 12px;font:16px system-ui">
   <h2>Registro de marca (SENADI) — Respuesta ejecutiva</h2>
