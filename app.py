@@ -1720,6 +1720,249 @@ def responses_toolcheck():
 
 
 
+@app.route("/responses/toolcheckLast", methods=["GET"])
+def responses_toolcheck():
+    """
+    /responses/toolcheck
+    - Responde en HTML (text/html) para cualquier pregunta gerencial (?q=...).
+    - Usa GPT-5 con Web Search (≤7 búsquedas) y devuelve un informe ejecutivo de alta calidad.
+    - Si el modelo no produce texto (p.ej. termina en tool-calls), fuerza un cierre SIN herramientas (HTML).
+    """
+    import os, re, json, traceback
+    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+    from flask import request, Response
+    from openai import OpenAI
+
+    # ------------- Helpers -------------
+    def _safe_text(resp):
+        """Extrae texto aunque output_text venga vacío."""
+        try:
+            txt = (getattr(resp, "output_text", "") or "").strip()
+            if txt:
+                return txt
+        except Exception:
+            pass
+        parts = []
+        try:
+            for it in (getattr(resp, "output", []) or []):
+                if (getattr(it, "type", "") or "").lower() == "message":
+                    for c in (getattr(it, "content", []) or []):
+                        t = getattr(c, "text", None)
+                        if t:
+                            parts.append(t)
+        except Exception:
+            pass
+        return "\n".join([p for p in parts if p]).strip()
+
+    def _resp_to_dict(resp):
+        for attr in ("model_dump_json", "json"):
+            fn = getattr(resp, attr, None)
+            if callable(fn):
+                try:
+                    return json.loads(fn())
+                except Exception:
+                    pass
+        try:
+            d = {}
+            for k, v in resp.__dict__.items():
+                try:
+                    json.dumps(v); d[k] = v
+                except Exception:
+                    d[k] = str(v)
+            return d
+        except Exception:
+            return {"_raw": str(resp)}
+
+    def _strip_tracking_params_in_text(text: str) -> str:
+        """Elimina utm_* y similares de los enlaces en el HTML/Markdown plano."""
+        if not text: 
+            return text
+        def _clean_url(u):
+            try:
+                p = urlparse(u)
+                qs = [(k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=True)
+                      if not (k.lower().startswith("utm_") or k.lower() in {"fbclid","gclid","mc_eid","mc_cid","ref"})]
+                new_q = urlencode(qs, doseq=True)
+                return urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, p.fragment))
+            except Exception:
+                return u
+        url_rx = re.compile(r"https?://[^\s<>\)\]\"']+")
+        return url_rx.sub(lambda m: _clean_url(m.group(0)), text)
+
+    def _looks_html(s: str) -> bool:
+        return bool(s and re.search(r"</?(h\d|p|ul|ol|li|div|section|article|table|thead|tbody|tr|td|th|strong|em|a)\b", s, re.I))
+
+    def _markdownish_to_html(s: str) -> str:
+        """Fallback MUY básico si el modelo devolviera Markdown en vez de HTML."""
+        if not s: 
+            return ""
+        # enlaces [texto](url)
+        s = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', s)
+        # **negritas** y *itálicas*
+        s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+        s = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", s)
+        # encabezados simples
+        s = re.sub(r"^# (.+)$", r"<h2>\1</h2>", s, flags=re.M)
+        s = re.sub(r"^## (.+)$", r"<h3>\1</h3>", s, flags=re.M)
+        # bullets
+        lines = s.splitlines()
+        html_lines, in_ul = [], False
+        for ln in lines:
+            if re.match(r"^\s*[-•]\s+", ln):
+                if not in_ul:
+                    html_lines.append("<ul>")
+                    in_ul = True
+                html_lines.append("<li>" + re.sub(r"^\s*[-•]\s+", "", ln) + "</li>")
+            else:
+                if in_ul:
+                    html_lines.append("</ul>")
+                    in_ul = False
+                if ln.strip():
+                    html_lines.append(f"<p>{ln}</p>")
+        if in_ul:
+            html_lines.append("</ul>")
+        return "\n".join(html_lines)
+
+    def _ensure_html(body: str, title: str = "Asesor Ejecutivo") -> str:
+        """Garantiza documento HTML con estilo mínimo."""
+        body = body.strip()
+        if not _looks_html(body):
+            body = _markdownish_to_html(body)
+        style = """
+<style>
+:root { --ink:#0b1320; --muted:#5b6472; --brand:#1b72ff; --bg:#ffffff; }
+html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui, -apple-system, Segoe UI, Roboto, Arial;}
+.article{max-width:860px;margin:24px auto;padding:24px;}
+h1,h2,h3{line-height:1.25;margin:18px 0 10px;}
+h1{font-size:26px} h2{font-size:22px} h3{font-size:18px}
+p,li{color:#1d2430}
+ul,ol{padding-left:22px}
+.card{background:#fff;border:1px solid #e8edf3;border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 1px 2px rgba(16,24,40,.03)}
+.badge{display:inline-block;padding:4px 10px;border-radius:999px;background:#eef4ff;color:#1b4dff;font-weight:600;font-size:12px}
+a{color:var(--brand);text-decoration:none}
+a:hover{text-decoration:underline}
+table{border-collapse:collapse;width:100%;margin:10px 0;border:1px solid #e8edf3}
+th,td{border:1px solid #e8edf3;padding:10px;text-align:left}
+.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:var(--muted)}
+hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
+</style>"""
+        html = f"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+{style}
+</head>
+<body>
+<article class="article">
+{body}
+</article>
+</body></html>"""
+        return html
+
+    def _render_error_html(title: str, subtitle: str, detail: str = "") -> str:
+        body = f"""
+<h2>⚠️ {title}</h2>
+<p class="mono">{subtitle}</p>
+{('<pre class="card mono">'+(detail or '').replace('<','&lt;')+'</pre>') if detail else ''}
+"""
+        return _ensure_html(body, title="Error")
+
+    # ------------- Config & Client -------------
+    api_key = os.getenv("OPENAI_API_KEY")
+    project = os.getenv("OPENAI_PROJECT")
+    if not api_key:
+        html = _render_error_html("Falta OPENAI_API_KEY", "Configura tu variable de entorno OPENAI_API_KEY.")
+        return Response(html, mimetype="text/html")
+
+    try:
+        client = OpenAI(api_key=api_key, project=project)
+    except Exception as e:
+        html = _render_error_html("No se pudo crear cliente OpenAI", str(e))
+        return Response(html, mimetype="text/html")
+
+    # ------------- Params -------------
+    q = (request.args.get("q") or "como registrar una marca en ecuador").strip()
+    model = (request.args.get("model") or "gpt-5").strip()
+    preview = request.args.get("preview") == "1"
+    try:
+        max_out = int(request.args.get("max", "1600"))
+    except Exception:
+        max_out = 1600
+
+    # ------------- Prompt Persona -------------
+    SYSTEM = (
+        "Eres un ASESOR EJECUTIVO para gerentes en Ecuador y LATAM. "
+        "Devuelves SIEMPRE **HTML válido** (no Markdown, no backticks). "
+        "Respuesta de ALTÍSIMA calidad, directa ('answer-first') y accionable. "
+        "Si usas Web Search, tope ≤7 búsquedas; prioriza dominios oficiales/reguladores y fuentes confiables. "
+        "Estructura recomendada (adáptala al caso): "
+        "<h2>🧭 Respuesta ejecutiva</h2> bullets; "
+        "<h2>Decisiones y alternativas</h2> pros/cons; "
+        "<h2>Plan 30-60-90</h2>; "
+        "<h2>Costos/ROI (si aplica)</h2>; "
+        "<h2>Riesgos & Compliance</h2> (normas/autoridades); "
+        "<h2>KPIs & Checklist</h2>; "
+        "<h2>📚 Fuentes consultadas</h2> (5–7 enlaces, dominios únicos) "
+        "<h2>🔎 Búsquedas realizadas (≤7)</h2> (query + URL principal, si existe). "
+        "Nunca inventes montos/plazos/leyes; si faltan datos precisos, usa '—' y explica cómo obtenerlos."
+    )
+    USER = (
+        f"Pregunta del gerente: {q}\n"
+        "Entrega SOLO HTML. No incluyas explicaciones fuera del HTML. "
+        "Usa listas, tablas y subtítulos cuando ayuden a decidir."
+    )
+    tool = {"type": "web_search_preview"} if preview else {"type": "web_search"}
+
+    req = {
+        "model": model,
+        "tools": [tool],
+        "input": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": USER},
+        ],
+        "max_output_tokens": max_out  # No usar temperature/top_p en este modelo
+    }
+
+    # ------------- Llamada principal (con Web Search) -------------
+    try:
+        r = client.responses.create(**req)
+    except Exception as e:
+        # Error fatal de la llamada
+        tb = "\n".join(traceback.format_exc().splitlines()[-6:])
+        detail = f"{e}\n\n{tb}"
+        html = _render_error_html("Fallo en Responses API (principal)", str(e), detail)
+        return Response(html, mimetype="text/html")
+
+    text = _safe_text(r)
+    text = _strip_tracking_params_in_text(text)
+
+    # ------------- Fallback SIN herramientas (forzar HTML) -------------
+    if not text:
+        finalize_req = {
+            "model": model,
+            "input": [
+                {"role": "system",
+                 "content": ("Ahora debes ENTREGAR la respuesta final en **HTML válido**, "
+                             "clara y 'answer-first' (máx 600 palabras), SIN usar herramientas. "
+                             "No devuelvas Markdown ni backticks.")},
+                {"role": "user", "content": USER},
+            ],
+            "max_output_tokens": max_out
+        }
+        try:
+            r2 = client.responses.create(**finalize_req)
+            text = _safe_text(r2)
+            text = _strip_tracking_params_in_text(text)
+        except Exception as e:
+            html = _render_error_html("Fallo en cierre forzado", str(e))
+            return Response(html, mimetype="text/html")
+
+    # ------------- Asegurar HTML y responder -------------
+    html_body = text if _looks_html(text) else _markdownish_to_html(text)
+    full_html = _ensure_html(html_body, title="Asesor Ejecutivo")
+
+    return Response(full_html, mimetype="text/html")
 
 
 
