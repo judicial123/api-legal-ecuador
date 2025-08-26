@@ -1902,7 +1902,7 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
 
 
 # --- GET /responses/testMarcaCostProV3 (calidad alta, costo mínimo, sin temperature/top_p) ---
-# --- GET /responses/testMarcaCostProV4 (muestra respuesta + panel de costo) ---
+# --- GET /responses/testMarcaCostProV4 (muestra respuesta + panel costo, optimizado) ---
 app.view_functions.pop("responses_testMarcaCostProV4", None)
 
 @app.route("/responses/testMarcaCostProV4", methods=["GET"])
@@ -2087,7 +2087,7 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
         return Response(_page("<h2>⚠️ Falta OPENAI_API_KEY</h2>"), mimetype="text/html; charset=utf-8")
     client = OpenAI(api_key=api_key, project=project)
 
-    # ---------- Prompts (límite por instrucción y NO devolver página completa) ----------
+    # ---------- Prompts (sin <html>/<body>) ----------
     SYSTEM = (
         "Eres asesor experto en SENADI. Devuelve SOLO HTML válido, claro y answer-first. "
         "IMPORTANTE: devuelve SOLO el CONTENIDO del artículo (sin <!doctype>, sin <html>, sin <head>, sin <body>). "
@@ -2111,10 +2111,9 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
         f"<h2>🔎 Búsquedas realizadas (≤{max_web})</h2>\n"
         "Si falta dato oficial, usa '—' y añade 'Cómo verificar' con la ruta exacta en el sitio."
     )
+    tools = [{"type": "web_search_preview"}]
 
-    tools = [{"type": "web_search_preview"}]  # schema válido
-
-    # ---------- Call 1 (cap OUT agresivo para costo) ----------
+    # ---------- Call 1 (cap OUT agresivo) ----------
     req1 = {
         "model": "gpt-5",
         "tools": tools,
@@ -2122,30 +2121,138 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "max_output_tokens": (1500 if tight else 1800)  # menor para ahorrar sin perder secciones
+        "max_output_tokens": (1500 if tight else 1800)
     }
-
     t0 = time.perf_counter()
     r1 = client.responses.create(**req1)
     t1 = time.perf_counter()
 
     txt = _safe_text(r1)
     txt = _strip_tracking(txt)
-    txt = _extract_inner_html(txt)  # ← desenvolver por si vino página completa
+    txt = _extract_inner_html(txt)
     u1 = _extract_usage(r1)
     _, web_queries = _count_web_calls(r1)
-
     steps = [{"name":"call_1","usage":u1,"model":"gpt-5","ms":int((t1-t0)*1000),"queries":web_queries}]
 
     # ---------- Quality Gate ----------
-    def _has(h, label): return re.search(rf"<h2[^>]*>\s*{label}\s*</h2>", h or "", re.I) is not None
+    def _has(h, label):
+        return re.search(rf"<h2[^>]*>\s*{re.escape(label)}\s*</h2>", h or "", re.I) is not None
     needed = ["🧭 Resumen rápido","Pasos oficiales","Costos y tasas","Plazos","📚 Fuentes consultadas","🔎 Búsquedas realizadas"]
     missing = [lab for lab in needed if not _has(txt, lab)]
     missing_effective = [lab for lab in missing if lab != "🔎 Búsquedas realizadas"]
 
     def _count_dashes_section(h, section_label):
         if not _has(h, section_label): return 99
-        m = re.search(r
+        m = re.search(r"(?is)(<h2[^>]*>\s*"+re.escape(section_label)+r"\s*</h2>)(.*?)(<h2|\Z)", h or "")
+        seg = (m.group(2) if m else "") or ""
+        return seg.count("—")
+
+    dashes_costos = _count_dashes_section(txt, "Costos y tasas")
+    dashes_plazos = _count_dashes_section(txt, "Plazos")
+
+    # ---------- Mini-fix 1 (sin herramientas) ----------
+    if missing_effective:
+        req_fix1 = {
+            "model": "gpt-5",
+            "input": [
+                {"role":"system","content":"Eres editor. Devuelve SOLO HTML válido (sin html/head/body). Completa SOLO las secciones faltantes listadas, sin repetir lo existente. Máx 300–450 palabras. Sin herramientas."},
+                {"role":"user","content":"Secciones obligatorias: "+", ".join(needed)+". Faltantes: "+", ".join(missing_effective)+". Devuelve solo el HTML de esas secciones."}
+            ],
+            "max_output_tokens": 450
+        }
+        t2 = time.perf_counter()
+        r_fix1 = client.responses.create(**req_fix1)
+        t3 = time.perf_counter()
+        add = _safe_text(r_fix1)
+        add = _strip_tracking(add)
+        add = _extract_inner_html(add)
+        u_fix1 = _extract_usage(r_fix1)
+        steps.append({"name":"mini_fix_sections","usage":u_fix1,"model":"gpt-5","ms":int((t3-t2)*1000),"queries":[]})
+        txt = (txt or "").rstrip() + ("\n" if not (txt or "").endswith("\n") else "") + (add or "")
+
+    # ---------- Mini-fix 2 (≤2 búsquedas) si hay demasiados “—” ----------
+    if (dashes_costos + dashes_plazos) >= 4:
+        req_fix2 = {
+            "model": "gpt-5",
+            "tools": [{"type": "web_search_preview"}],
+            "input": [
+                {"role":"system","content":(
+                    "Eres verificador. Devuelve SOLO HTML válido (sin html/head/body) y conciso. "
+                    "Realiza **como máximo 2 búsquedas** y trae el contexto mínimo. "
+                    "Objetivo: completar montos/plazos oficiales faltantes en 'Costos y tasas' y/o 'Plazos' con enlaces oficiales. "
+                    "No reescribas todo; entrega solo la tabla o bullets que reemplacen '—'. Máx 300–350 palabras."
+                )},
+                {"role":"user","content":"Completa valores ausentes en Costos/Plazos y cita solo SENADI, WIPO u órgano andino. Devuelve bloque listo para insertar."}
+            ],
+            "max_output_tokens": 350
+        }
+        t4 = time.perf_counter()
+        r_fix2 = client.responses.create(**req_fix2)
+        t5 = time.perf_counter()
+        fill = _safe_text(r_fix2)
+        fill = _strip_tracking(fill)
+        fill = _extract_inner_html(fill)
+        u_fix2 = _extract_usage(r_fix2)
+        _, q2 = _count_web_calls(r_fix2)
+        steps.append({"name":"targeted_fill","usage":u_fix2,"model":"gpt-5","ms":int((t5-t4)*1000),"queries":q2})
+        txt = (txt or "").rstrip() + ("\n" if not (txt or "").endswith("\n") else "") + (fill or "")
+
+    # ---------- Panel de costo ----------
+    def _row(s):
+        c = _cost_from_usage(s["usage"], model_name="gpt-5", pin_override=pin_override, pout_override=pout_override)
+        return (f"<tr><td>{s['name']}</td>"
+                f"<td class='mono'>{s['usage']['input']}</td>"
+                f"<td class='mono'>{s['usage']['output']}</td>"
+                f"<td class='mono'>{s['usage']['total']}</td>"
+                f"<td class='mono'>{s['usage'].get('cached',0)} cached</td>"
+                f"<td class='mono'>{s['ms']} ms</td>"
+                f"<td class='mono'>${c['total_usd']:.6f}</td></tr>")
+
+    usage_total = _sum_usage(*[s["usage"] for s in steps])
+    cost_total = _cost_from_usage(usage_total, model_name="gpt-5", pin_override=pin_override, pout_override=pout_override)
+    rows = "".join(_row(s) for s in steps)
+    pin = cost_total["pin"]; pout = cost_total["pout"]
+
+    warn_rates = ""
+    if pin == 0.0 and pout == 0.0:
+        warn_rates = "<div class='warn mono'>Advertencia: tarifas IN/OUT = 0. Define OPENAI_PRICE_GPT5_IN / OPENAI_PRICE_GPT5_OUT o pásalas por querystring ?pin=...&pout=...</div>"
+
+    queries_html = ""
+    for s in steps:
+        if s.get("queries"):
+            items = "".join([f"<li class='mono'>{htmlmod.escape(q)}</li>" for q in s["queries"]])
+            queries_html += f"<div class='card'><h3>🔎 Queries usadas en {s['name']}</h3><ul>{items}</ul></div>"
+
+    panel = f"""
+<div class="card">
+  <h2>💸 Resumen de costo</h2>
+  <div class="grid">
+    <div class="kv"><span>Modelo</span><span class="mono">gpt-5</span></div>
+    <div class="kv"><span>Tokens (IN/OUT/TOTAL)</span><span class="mono">{usage_total['input']} / {usage_total['output']} / {usage_total['total']}</span></div>
+    <div class="kv"><span>Cached tokens (IN)</span><span class="mono">{usage_total.get('cached',0)}</span></div>
+    <div class="kv"><span>Tarifas (USD/1K)</span><span class="mono">IN ${pin:.6f} · OUT ${pout:.6f}</span></div>
+    <div class="kv"><span>Costo total</span><span class="mono"><strong>${cost_total['total_usd']:.6f}</strong></span></div>
+  </div>
+  {warn_rates}
+  <h3>Desglose por paso</h3>
+  <table class="table">
+    <thead><tr><th>Paso</th><th>IN</th><th>OUT</th><th>TOTAL</th><th>IN cached</th><th>Tiempo</th><th>Costo</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <p class="mono">Límites por instrucción: ≤{max_web} búsquedas iniciales; si faltan datos oficiales, pasada dirigida ≤2 búsquedas.</p>
+</div>
+{queries_html}
+"""
+
+    # ---------- Render final (respuesta SIEMPRE visible) ----------
+    if not (txt or "").strip():
+        txt = "<p class='mono'>[WARN] No llegó contenido del modelo.</p>"
+    content_html = txt if _looks_html(txt) else _markdownish_to_html(txt)
+    body = "<h2>Registro de marca en Ecuador (SENADI)</h2>" + panel + content_html
+
+    raw_note = htmlmod.escape(getattr(r1, "model_dump_json", lambda:"{}")())
+    return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
+
 
 
 
