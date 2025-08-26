@@ -2066,18 +2066,8 @@ def test_marca_simple():
         "Reglas: bullets breves; solo pasos, tiempos y dinero; enlaces clicables."
     )
 
-    # 🔧 CLAVE: usar web_search (no web_search_preview)
-    tools = [
-        {
-            "type": "web_search",
-            # Tip: algunos SDKs aceptan options; si tu versión no, quita "options".
-            "options": {
-                "max_results": 3,
-                "strict": True,
-                "domains": ["www.derechosintelectuales.gob.ec", "derechosintelectuales.gob.ec"]
-            }
-        }
-    ]
+    # ✅ Usar web_search simple
+    tools = [{"type": "web_search"}]
 
     req = {
         "model": "gpt-5",
@@ -2086,8 +2076,8 @@ def test_marca_simple():
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "temperature": 0,                 # sin creatividad
-        "tool_choice": "auto",            # deja que el modelo llame web_search
+        "temperature": 0,       # sin creatividad
+        "tool_choice": "auto",  # deja que el modelo llame web_search
         "max_output_tokens": 900
     }
 
@@ -2100,7 +2090,7 @@ def test_marca_simple():
     qs = _queries(resp)
 
     if not html_out:
-        # Si a pesar de todo no llega texto final, mostramos un fallback con el JSON para diagnóstico rápido
+        # Si no llega texto final, mostramos JSON de diagnóstico
         raw = html.escape(getattr(resp, "model_dump_json", lambda: "{}")())
         html_out = (
             "<p>No se obtuvo respuesta final del modelo.</p>"
@@ -2122,6 +2112,7 @@ def test_marca_simple():
   {html_out}
 </div>"""
     return Response(page, mimetype="text/html; charset=utf-8")
+
 
 if __name__ == "__main__":
     # flask --app app_test_marca_simple.py run --debug
