@@ -1901,11 +1901,11 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
     return Response(full_html, mimetype="text/html")
 
 
-# --- GET /responses/testMarcaCostProV2 (calidad alta, costo mínimo, schema válido) ---
-app.view_functions.pop("responses_testMarcaCostProV2", None)
+# --- GET /responses/testMarcaCostProV3 (calidad alta, costo mínimo, sin temperature/top_p) ---
+app.view_functions.pop("responses_testMarcaCostProV3", None)
 
-@app.route("/responses/testMarcaCostProV2", methods=["GET"])
-def responses_testMarcaCostProV2():
+@app.route("/responses/testMarcaCostProV3", methods=["GET"])
+def responses_testMarcaCostProV3():
     import os, re, json, time, html as htmlmod
     from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
     from flask import request, Response
@@ -1945,9 +1945,10 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
 .table{{width:100%;border-collapse:collapse}}
 .table th,.table td{{border:1px solid #eef1f5;padding:8px;font-size:14px}}
 .table th{{background:#fafbff;text-align:left}}
+.warn{{background:#fff8e1;border:1px solid #ffe3a3;border-radius:10px;padding:10px;margin-top:8px}}
 </style>
 <div class="article">
-  <div class="banner">🟢 <strong>Endpoint activo.</strong> Optimizado para costo (calidad alta).</div>
+  <div class="banner">🟢 <strong>Endpoint activo.</strong> Optimizado para costo (calidad alta, schema válido).</div>
   {body}
   {('<details><summary class="mono">debug</summary>'+note+'</details>') if note else ''}
 </div></html>"""
@@ -1999,15 +2000,22 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
         inp = int(u.get("input_tokens") or 0)
         out = int(u.get("output_tokens") or 0)
         tot = int(u.get("total_tokens") or (inp + out))
-        return {"input":inp,"output":out,"total":tot}
+        # intento de leer cached_tokens si existe
+        cached = 0
+        try:
+            cached = int(((u.get("input_tokens_details") or {}).get("cached_tokens")) or 0)
+        except Exception:
+            pass
+        return {"input":inp,"output":out,"total":tot,"cached":cached}
 
     def _sum_usage(*usages):
-        s = {"input":0,"output":0,"total":0}
+        s = {"input":0,"output":0,"total":0,"cached":0}
         for u in usages:
             if not u: continue
             s["input"] += int(u.get("input",0))
             s["output"] += int(u.get("output",0))
             s["total"] += int(u.get("total",0))
+            s["cached"] += int(u.get("cached",0))
         if s["total"]==0 and (s["input"] or s["output"]):
             s["total"] = s["input"] + s["output"]
         return s
@@ -2070,16 +2078,16 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
     SYSTEM = (
         "Eres asesor experto en SENADI. Devuelve SOLO HTML válido, claro y answer-first. "
         f"Usa web_search_preview solo si es imprescindible para citar y **nunca hagas más de {max_web} búsquedas**. "
-        "Cuando busques, prioriza estos dominios: derechosintelectuales.gob.ec, wipo.int, comunidadandina.org. "
-        "Resume los resultados para que el CONTEXTO sea pequeño ('small') y evita traer texto irrelevante. "
-        "Reglas: (1) Todo monto/plazo debe llevar **enlace oficial**; si no existe fuente clara, usa '—' y añade 'Cómo verificar'. "
-        "(2) No des rangos orientativos para tasas oficiales. "
-        "(3) Cierra aquí la respuesta (no termines en tool-call). "
+        "Prioriza: derechosintelectuales.gob.ec, wipo.int, comunidadandina.org. "
+        "Resume resultados para que el CONTEXTO sea pequeño ('small') y evita texto irrelevante. "
+        "Reglas: (1) Todo monto/plazo con **enlace oficial**; si no hay fuente clara, usa '—' y añade 'Cómo verificar'. "
+        "(2) No des rangos orientativos de tasas. (3) Cierra aquí la respuesta (no termines en tool-call). "
         f"Extensión objetivo: {'700–1000' if tight else '900–1200'} palabras."
     )
     USER = (
-        f"Tema: {q}. Informe ejecutivo sobre registro de marca en Ecuador (SENADI): Casillero Virtual, Solicitudes en línea (signos distintivos), "
-        "Gaceta y oposiciones (30 días hábiles), Clasificación de Niza (OMPI), vigencia 10 años. "
+        f"Tema: {q}. Informe ejecutivo sobre registro de marca en Ecuador (SENADI): Casillero Virtual, "
+        "Solicitudes en línea (signos distintivos), Gaceta y oposiciones (30 días hábiles), "
+        "Clasificación de Niza (OMPI), vigencia 10 años. "
         "Secciones obligatorias:\n"
         "<h2>🧭 Resumen rápido</h2>\n"
         "<h2>Pasos oficiales</h2>\n"
@@ -2090,8 +2098,7 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
         "Si falta dato oficial, usa '—' y añade 'Cómo verificar' con la ruta exacta en el sitio."
     )
 
-    # ---------- SOLO herramientas permitidas por el schema ----------
-    tools = [{"type": "web_search_preview"}]
+    tools = [{"type": "web_search_preview"}]  # ← único valor permitido por schema
 
     # ---------- Call 1 ----------
     req1 = {
@@ -2101,9 +2108,7 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "max_output_tokens": 1700 if tight else 2000,
-        "temperature": 0.2,
-        "top_p": 1.0
+        "max_output_tokens": (1700 if tight else 2000)  # SIN temperature/top_p
     }
 
     t0 = time.perf_counter()
@@ -2131,7 +2136,7 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
     dashes_costos = _count_dashes_section(txt, "Costos y tasas")
     dashes_plazos = _count_dashes_section(txt, "Plazos")
 
-    # ---------- Mini-fix 1: completar secciones faltantes (SIN herramientas) ----------
+    # ---------- Mini-fix 1 (SIN herramientas) ----------
     u_fix1 = None
     if missing:
         req_fix1 = {
@@ -2140,8 +2145,7 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
                 {"role":"system","content":"Eres editor. Devuelve SOLO HTML válido. Completa ÚNICAMENTE las secciones faltantes listadas, sin repetir lo existente. Máx 400–600 palabras. Sin herramientas."},
                 {"role":"user","content":"Secciones obligatorias: "+", ".join(needed)+". Faltantes: "+", ".join(missing)+". Devuelve solo el HTML de esas secciones."}
             ],
-            "max_output_tokens": 600,
-            "temperature": 0.2
+            "max_output_tokens": 600
         }
         t2 = time.perf_counter()
         r_fix1 = client.responses.create(**req_fix1)
@@ -2151,42 +2155,40 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
         steps.append({"name":"mini_fix_sections","usage":u_fix1,"model":"gpt-5","ms":int((t3-t2)*1000),"queries":[]})
         txt = (txt or "").rstrip() + ("\n" if not (txt or "").endswith("\n") else "") + (add or "")
 
-    # ---------- Mini-fix 2: demasiados “—” en Costos/Plazos → pasada dirigida (≤2 búsquedas) ----------
+    # ---------- Mini-fix 2: Targeted fill (≤2 búsquedas) ----------
     u_fix2 = None
     if (dashes_costos + dashes_plazos) >= 3:
-        tools_fix = [{"type": "web_search_preview"}]  # sin parámetros extra
         req_fix2 = {
             "model": "gpt-5",
-            "tools": tools_fix,
+            "tools": [{"type": "web_search_preview"}],
             "input": [
                 {"role":"system","content":(
                     "Eres verificador. Devuelve SOLO HTML válido y conciso. "
-                    "Realiza **como máximo 2 búsquedas** y trae el contexto mínimo (pequeño). "
+                    f"Realiza **como máximo 2 búsquedas** y trae el contexto mínimo (pequeño). "
                     "Objetivo: completar montos/plazos oficiales faltantes en 'Costos y tasas' y/o 'Plazos' con enlaces oficiales. "
                     "No reescribas todo; entrega solo la tabla o bullets que reemplacen '—'. Máx 350 palabras."
                 )},
                 {"role":"user","content":"Completa valores ausentes en Costos/Plazos y cita solo SENADI, WIPO u órgano andino. Devuelve bloque listo para insertar."}
             ],
-            "max_output_tokens": 450,
-            "temperature": 0.2
+            "max_output_tokens": 450
         }
         t4 = time.perf_counter()
         r_fix2 = client.responses.create(**req_fix2)
         t5 = time.perf_counter()
         fill = _safe_text(r_fix2)
         u_fix2 = _extract_usage(r_fix2)
-        # contar queries también aquí
         _, q2 = _count_web_calls(r_fix2)
         steps.append({"name":"targeted_fill","usage":u_fix2,"model":"gpt-5","ms":int((t5-t4)*1000),"queries":q2})
         txt = (txt or "").rstrip() + ("\n" if not (txt or "").endswith("\n") else "") + (fill or "")
 
-    # ---------- Costeo total ----------
+    # ---------- Costo total ----------
     def _row(s):
         c = _cost_from_usage(s["usage"], model_name="gpt-5", pin_override=pin_override, pout_override=pout_override)
         return (f"<tr><td>{s['name']}</td>"
                 f"<td class='mono'>{s['usage']['input']}</td>"
                 f"<td class='mono'>{s['usage']['output']}</td>"
                 f"<td class='mono'>{s['usage']['total']}</td>"
+                f"<td class='mono'>{s['usage'].get('cached',0)} cached</td>"
                 f"<td class='mono'>{s['ms']} ms</td>"
                 f"<td class='mono'>${c['total_usd']:.6f}</td></tr>")
 
@@ -2195,7 +2197,10 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
     rows = "".join(_row(s) for s in steps)
     pin = cost_total["pin"]; pout = cost_total["pout"]
 
-    # ---------- Panel costo & queries ----------
+    warn_rates = ""
+    if pin == 0.0 and pout == 0.0:
+        warn_rates = "<div class='warn mono'>Advertencia: tarifas IN/OUT = 0. Define OPENAI_PRICE_GPT5_IN / OPENAI_PRICE_GPT5_OUT o pásalas por querystring ?pin=...&pout=...</div>"
+
     queries_html = ""
     for s in steps:
         if s.get("queries"):
@@ -2208,15 +2213,17 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
   <div class="grid">
     <div class="kv"><span>Modelo</span><span class="mono">gpt-5</span></div>
     <div class="kv"><span>Tokens (IN/OUT/TOTAL)</span><span class="mono">{usage_total['input']} / {usage_total['output']} / {usage_total['total']}</span></div>
+    <div class="kv"><span>Cached tokens (IN)</span><span class="mono">{usage_total.get('cached',0)}</span></div>
     <div class="kv"><span>Tarifas (USD/1K)</span><span class="mono">IN ${pin:.6f} · OUT ${pout:.6f}</span></div>
     <div class="kv"><span>Costo total</span><span class="mono"><strong>${cost_total['total_usd']:.6f}</strong></span></div>
   </div>
+  {warn_rates}
   <h3>Desglose por paso</h3>
   <table class="table">
-    <thead><tr><th>Paso</th><th>IN</th><th>OUT</th><th>TOTAL</th><th>Tiempo</th><th>Costo</th></tr></thead>
+    <thead><tr><th>Paso</th><th>IN</th><th>OUT</th><th>TOTAL</th><th>IN cached</th><th>Tiempo</th><th>Costo</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
-  <p class="mono">Límites aplicados por instrucción: ≤{max_web} búsquedas iniciales, contexto pequeño, y como máximo 2 búsquedas en la pasada dirigida.</p>
+  <p class="mono">Límites aplicados por instrucción: ≤{max_web} búsquedas iniciales; si faltan datos oficiales en Costos/Plazos, pasada dirigida con ≤2 búsquedas.</p>
 </div>
 {queries_html}
 """
@@ -2225,9 +2232,10 @@ a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
     content_html = txt if _looks_html(txt) else _markdownish_to_html(txt)
     body = "<h2>Registro de marca en Ecuador (SENADI)</h2>" + panel + content_html
 
-    # debug crudo del response (para ver usage real y tool-calls)
+    # debug crudo del response
     raw_note = htmlmod.escape(getattr(r1, "model_dump_json", lambda:"{}")())
     return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
+
 
 
 
