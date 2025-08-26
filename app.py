@@ -1901,357 +1901,145 @@ hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
     return Response(full_html, mimetype="text/html")
 
 
-# --- GET /responses/testMarcaCostProV3 (calidad alta, costo mínimo, sin temperature/top_p) ---
-# --- GET /responses/testMarcaCostProV4 (muestra respuesta + panel costo, optimizado) ---
-app.view_functions.pop("responses_testMarcaCostProV4", None)
+# app_test_marca_simple.py
+from flask import Flask, Response, request
+from openai import OpenAI
+import os, html, json, re, time
 
-@app.route("/responses/testMarcaCostProV4", methods=["GET"])
-def responses_testMarcaCostProV4():
-    import os, re, json, time, html as htmlmod
-    from urllib.parse import urlparse, urlunparse, parse_qsl
-    from flask import request, Response
-    try:
-        from openai import OpenAI
-    except Exception as e:
-        return Response(
-            f"<!doctype html><meta charset='utf-8'><h2>🟢 Endpoint ok</h2><pre class='mono'>{htmlmod.escape(str(e))}</pre>",
-            mimetype="text/html; charset=utf-8"
-        )
+app = Flask(__name__)
 
-    # ---------- Params ----------
-    q = (request.args.get("q") or "como registrar una marca en ecuador").strip()
-    tight = request.args.get("tight") in {"1","true","yes","on"}
+def _safe_text(resp):
+    # Intenta obtener el texto final sin pelearse con la estructura del Responses API
     try:
-        max_web = max(1, min(5, int(request.args.get("max_web", "3"))))
+        t = (getattr(resp, "output_text", "") or "").strip()
+        if t:
+            return t
     except Exception:
-        max_web = 3
-    pin_override = request.args.get("pin")
-    pout_override = request.args.get("pout")
-    pin_override = float(pin_override) if pin_override not in (None, "") else None
-    pout_override = float(pout_override) if pout_override not in (None, "") else None
+        pass
+    parts = []
+    try:
+        for it in (getattr(resp, "output", []) or []):
+            if (getattr(it, "type", "") or "").lower() == "message":
+                for c in (getattr(it, "content", []) or []):
+                    tx = getattr(c, "text", None)
+                    if tx:
+                        parts.append(tx)
+    except Exception:
+        pass
+    return "\n".join(parts).strip()
 
-    # ---------- Mini UI ----------
-    def _page(body: str, note: str = "") -> str:
-        return f"""<!doctype html><html lang="es"><meta charset="utf-8">
-<style>
-html,body{{margin:0;padding:0;background:#fff;color:#0b1320;font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Arial}}
-.article{{max-width:960px;margin:24px auto;padding:24px}}
-.banner{{background:#eef4ff;padding:12px 16px;border:1px solid #d7e3ff;border-radius:10px;margin-bottom:14px}}
-.card{{background:#fff;border:1px solid #e8edf3;border-radius:14px;padding:16px;margin:14px 0;box-shadow:0 1px 2px rgba(16,24,40,.03)}}
-.grid{{display:grid;grid-template-columns: repeat(auto-fit,minmax(240px,1fr));gap:12px}}
-.kv{{display:flex;justify-content:space-between;border-bottom:1px dashed #eef1f5;padding:6px 0}}
-.kv span{{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#5b6472}}
-h1,h2,h3{{line-height:1.25;margin:18px 0 10px}} h2{{font-size:20px}} h3{{font-size:16px}}
-pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px solid #e8edf3;padding:12px;border-radius:10px}}
-a{{color:#1b72ff;text-decoration:none}} a:hover{{text-decoration:underline}}
-.badge{{display:inline-block;padding:4px 10px;border-radius:999px;background:#eef4ff;color:#1b4dff;font-weight:600;font-size:12px}}
-.mono{{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#5b6472}}
-.table{{width:100%;border-collapse:collapse}}
-.table th,.table td{{border:1px solid #eef1f5;padding:8px;font-size:14px}}
-.table th{{background:#fafbff;text-align:left}}
-.warn{{background:#fff8e1;border:1px solid #ffe3a3;border-radius:10px;padding:10px;margin-top:8px}}
-</style>
-<div class="article">
-  <div class="banner">🟢 <strong>Endpoint activo.</strong> Optimizado para costo (calidad alta, salida siempre visible).</div>
-  {body}
-  {('<details><summary class="mono">debug</summary>'+note+'</details>') if note else ''}
-</div></html>"""
+def _resp_json(resp):
+    try:
+        return json.loads(getattr(resp, "model_dump_json", lambda: "{}")())
+    except Exception:
+        return {}
 
-    def _looks_html(s: str) -> bool:
-        return bool(s and re.search(r"</?(h\d|p|ul|ol|li|div|section|article|table|thead|tbody|tr|td|th|strong|em|a)\b", s, re.I))
+def _usage(resp):
+    d = _resp_json(resp)
+    u = d.get("usage", {}) or {}
+    return {
+        "in": int(u.get("input_tokens") or 0),
+        "out": int(u.get("output_tokens") or 0),
+        "total": int(u.get("total_tokens") or ((u.get("input_tokens") or 0) + (u.get("output_tokens") or 0))),
+        "cached": int(((u.get("input_tokens_details") or {}).get("cached_tokens")) or 0),
+    }
 
-    def _markdownish_to_html(s: str) -> str:
-        if not s: return ""
-        s = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', s)
-        s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
-        s = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", s)
-        out, in_ul = [], False
-        for ln in s.splitlines():
-            if re.match(r"^\s*[-•]\s+", ln):
-                if not in_ul: out.append("<ul>"); in_ul=True
-                out.append("<li>"+re.sub(r"^\s*[-•]\s+", "", ln)+"</li>")
-            else:
-                if in_ul: out.append("</ul>"); in_ul=False
-                if ln.strip(): out.append(f"<p>{ln}</p>")
-        if in_ul: out.append("</ul>")
-        return "\n".join(out)
+def _queries(resp):
+    d = _resp_json(resp)
+    out = []
+    for item in d.get("output", []) or []:
+        t = (item.get("type","") or "").lower()
+        if "web" in t and "search" in t and "call" in t:
+            args = item.get("arguments") or item.get("tool_input") or {}
+            q = None
+            for k in ("q","query","search_query"):
+                if isinstance(args.get(k), str) and args.get(k).strip():
+                    q = args.get(k).strip()
+                    break
+            if q:
+                out.append(q)
+    # único
+    seen, uniq = set(), []
+    for q in out:
+        k = q.lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(q)
+    return uniq
 
-    def _strip_tracking(text: str) -> str:
-        if not text: return text
-        def _clean(u):
-            try:
-                p = urlparse(u)
-                qs = [(k,v) for (k,v) in parse_qsl(p.query, keep_blank_values=True)
-                      if not (k.lower().startswith("utm_") or k.lower() in {"gclid","fbclid","ref","mc_eid","mc_cid"})]
-                return urlunparse((p.scheme,p.netloc,p.path,p.params,("&".join([f"{k}={v}" for k,v in qs]) if qs else ""),p.fragment))
-            except Exception:
-                return u
-        return re.sub(r"https?://[^\s<>\)\]\"']+", lambda m: _clean(m.group(0)), text)
+@app.route("/responses/testMarcaSimple", methods=["GET"])
+def test_marca_simple():
+    # Parámetros mínimos
+    pregunta = (request.args.get("q") or "¿Cómo registrar una marca?").strip()
 
-    def _extract_inner_html(s: str) -> str:
-        """Si llega página completa, extrae solo el <body>; si no, devuelve el bloque limpio."""
-        if not s: return s
-        s = re.sub(r"(?is)<!doctype[^>]*>", "", s).strip()
-        m = re.search(r"(?is)<body[^>]*>(.*?)</body>", s)
-        if m: return m.group(1).strip()
-        if re.search(r"(?is)<html[^>]*>", s):
-            s = re.sub(r"(?is)<head[^>]*>.*?</head>", "", s)
-            s = re.sub(r"(?is)</?html[^>]*>", "", s)
-        return s.strip()
-
-    # ---------- Cost helpers ----------
-    def _resp_to_dict_safe(resp):
-        for attr in ("model_dump_json","json"):
-            fn = getattr(resp, attr, None)
-            if callable(fn):
-                try: return json.loads(fn())
-                except Exception: pass
-        try: return json.loads(getattr(resp, "model_dump_json", lambda: "{}")())
-        except Exception: return {}
-
-    def _extract_usage(resp):
-        d = _resp_to_dict_safe(resp) or {}
-        u = d.get("usage") or {}
-        inp = int(u.get("input_tokens") or 0)
-        out = int(u.get("output_tokens") or 0)
-        tot = int(u.get("total_tokens") or (inp + out))
-        cached = 0
-        try:
-            cached = int(((u.get("input_tokens_details") or {}).get("cached_tokens")) or 0)
-        except Exception:
-            pass
-        return {"input":inp,"output":out,"total":tot,"cached":cached}
-
-    def _sum_usage(*usages):
-        s = {"input":0,"output":0,"total":0,"cached":0}
-        for u in usages:
-            if not u: continue
-            s["input"] += int(u.get("input",0))
-            s["output"] += int(u.get("output",0))
-            s["total"] += int(u.get("total",0))
-            s["cached"] += int(u.get("cached",0))
-        if s["total"]==0 and (s["input"] or s["output"]):
-            s["total"] = s["input"] + s["output"]
-        return s
-
-    def _cost_from_usage(usage, model_name="gpt-5", pin_override=None, pout_override=None):
-        key = (model_name or "gpt-5").upper().replace("-", "")
-        pin = float(pin_override if pin_override is not None else os.getenv(f"OPENAI_PRICE_{key}_IN", "0") or 0)
-        pout = float(pout_override if pout_override is not None else os.getenv(f"OPENAI_PRICE_{key}_OUT", "0") or 0)
-        cin = (usage.get("input",0)/1000.0)*pin
-        cout = (usage.get("output",0)/1000.0)*pout
-        return {"in_usd":cin, "out_usd":cout, "total_usd":cin+cout, "pin":pin, "pout":pout}
-
-    def _safe_text(resp):
-        try:
-            t = (getattr(resp, "output_text", "") or "").strip()
-            if t: return t
-        except Exception: pass
-        parts = []
-        try:
-            for it in (getattr(resp, "output", []) or []):
-                if (getattr(it, "type", "") or "").lower()=="message":
-                    for c in (getattr(it, "content", []) or []):
-                        tx = getattr(c, "text", None)
-                        if tx: parts.append(tx)
-        except Exception: pass
-        return "\n".join(parts).strip()
-
-    def _count_web_calls(resp):
-        d = _resp_to_dict_safe(resp)
-        calls = 0; queries = []
-        def _tryq(obj):
-            if isinstance(obj, dict):
-                for k in ("query","q","search_query"):
-                    v = obj.get(k)
-                    if isinstance(v, str) and v.strip():
-                        return v.strip()
-            return None
-        for item in d.get("output", []) or []:
-            t = (item.get("type","") or "").lower()
-            if "web" in t and "search" in t and "call" in t:
-                calls += 1
-                q = _tryq(item.get("arguments") or {}) or _tryq(item.get("input") or {}) \
-                    or _tryq(item.get("parameters") or {}) or _tryq(item.get("tool_input") or {})
-                if q: queries.append(q)
-        seen=set(); uniq=[]
-        for q in queries:
-            k=q.lower()
-            if k not in seen:
-                seen.add(k); uniq.append(q)
-        return calls, uniq
-
-    # ---------- Client ----------
-    api_key = os.getenv("OPENAI_API_KEY"); project = os.getenv("OPENAI_PROJECT")
+    # Cliente
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return Response(_page("<h2>⚠️ Falta OPENAI_API_KEY</h2>"), mimetype="text/html; charset=utf-8")
-    client = OpenAI(api_key=api_key, project=project)
+        return Response("<h3>⚠️ Falta OPENAI_API_KEY</h3>", mimetype="text/html; charset=utf-8")
+    client = OpenAI(api_key=api_key, project=os.getenv("OPENAI_PROJECT"))
 
-    # ---------- Prompts (sin <html>/<body>) ----------
+    # Prompts súper enfocados
     SYSTEM = (
-        "Eres asesor experto en SENADI. Devuelve SOLO HTML válido, claro y answer-first. "
-        "IMPORTANTE: devuelve SOLO el CONTENIDO del artículo (sin <!doctype>, sin <html>, sin <head>, sin <body>). "
-        f"Usa web_search_preview solo si es imprescindible para citar y **nunca hagas más de {max_web} búsquedas**. "
-        "Prioriza: derechosintelectuales.gob.ec, wipo.int, comunidadandina.org. "
-        "Resume resultados para que el CONTEXTO sea pequeño y evita texto irrelevante. "
-        "Reglas: (1) Todo monto/plazo con **enlace oficial**; si no hay fuente clara, usa '—' y añade 'Cómo verificar'. "
-        "(2) No des rangos orientativos de tasas. (3) Cierra aquí la respuesta (no termines en tool-call). "
-        f"Extensión objetivo: {'700–1000' if tight else '900–1200'} palabras."
+        "Eres un asesor del SENADI. Responde en **HTML simple** (sin <html>/<body>) "
+        "de forma directiva y ejecutiva. "
+        "Usa H2 para secciones y bullets cortos. "
+        "Prohibido inventar: si un dato (costo/plazo) no está claro en la fuente oficial, pon '—' y añade 'Cómo verificar' "
+        "indicando la ruta exacta en el sitio. "
+        "Limítate SOLO a: PASOS, PLAZOS y DINERO para registrar una marca en Ecuador. "
+        "Usa como **única fuente** la URL indicada por el usuario. "
+        "Haz como máximo 2 búsquedas. Devuelve enlaces clicables."
     )
-    USER = (
-        f"Tema: {q}. Informe ejecutivo sobre registro de marca en Ecuador (SENADI): Casillero Virtual, "
-        "Solicitudes en línea (signos distintivos), Gaceta y oposiciones (30 días hábiles), "
-        "Clasificación de Niza (OMPI), vigencia 10 años. "
-        "Secciones obligatorias:\n"
-        "<h2>🧭 Resumen rápido</h2>\n"
-        "<h2>Pasos oficiales</h2>\n"
-        "<h2>Costos y tasas</h2>\n"
-        "<h2>Plazos</h2>\n"
-        "<h2>📚 Fuentes consultadas</h2>\n"
-        f"<h2>🔎 Búsquedas realizadas (≤{max_web})</h2>\n"
-        "Si falta dato oficial, usa '—' y añade 'Cómo verificar' con la ruta exacta en el sitio."
-    )
-    tools = [{"type": "web_search_preview"}]
 
-    # ---------- Call 1 (cap OUT agresivo) ----------
-    req1 = {
+    USER = (
+        "Pregunta gerencial: ¿Cómo registrar una marca en Ecuador?\n"
+        "URL objetivo (única fuente): https://www.derechosintelectuales.gob.ec/como-registro-una-marca/\n\n"
+        "Estructura obligatoria:\n"
+        "<h2>🧭 Resumen</h2>\n"
+        "<h2>Pasos oficiales</h2>\n"
+        "<h2>Costos</h2>\n"
+        "<h2>Plazos</h2>\n"
+        "<h2>Fuentes</h2>\n"
+        "Reglas: bullets breves, sin adornos; solo pasos, tiempos y dinero."
+    )
+
+    tools = [{"type": "web_search_preview"}]  # usa el buscador del Responses API
+
+    req = {
         "model": "gpt-5",
         "tools": tools,
         "input": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "max_output_tokens": (1500 if tight else 1800)
+        "max_output_tokens": 800
     }
+
     t0 = time.perf_counter()
-    r1 = client.responses.create(**req1)
-    t1 = time.perf_counter()
+    resp = client.responses.create(**req)
+    ms = int((time.perf_counter() - t0) * 1000)
 
-    txt = _safe_text(r1)
-    txt = _strip_tracking(txt)
-    txt = _extract_inner_html(txt)
-    u1 = _extract_usage(r1)
-    _, web_queries = _count_web_calls(r1)
-    steps = [{"name":"call_1","usage":u1,"model":"gpt-5","ms":int((t1-t0)*1000),"queries":web_queries}]
+    html_out = _safe_text(resp).strip() or "<p>No se obtuvo respuesta.</p>"
+    use = _usage(resp)
+    qs = _queries(resp)
 
-    # ---------- Quality Gate ----------
-    def _has(h, label):
-        return re.search(rf"<h2[^>]*>\s*{re.escape(label)}\s*</h2>", h or "", re.I) is not None
-    needed = ["🧭 Resumen rápido","Pasos oficiales","Costos y tasas","Plazos","📚 Fuentes consultadas","🔎 Búsquedas realizadas"]
-    missing = [lab for lab in needed if not _has(txt, lab)]
-    missing_effective = [lab for lab in missing if lab != "🔎 Búsquedas realizadas"]
-
-    def _count_dashes_section(h, section_label):
-        if not _has(h, section_label): return 99
-        m = re.search(r"(?is)(<h2[^>]*>\s*"+re.escape(section_label)+r"\s*</h2>)(.*?)(<h2|\Z)", h or "")
-        seg = (m.group(2) if m else "") or ""
-        return seg.count("—")
-
-    dashes_costos = _count_dashes_section(txt, "Costos y tasas")
-    dashes_plazos = _count_dashes_section(txt, "Plazos")
-
-    # ---------- Mini-fix 1 (sin herramientas) ----------
-    if missing_effective:
-        req_fix1 = {
-            "model": "gpt-5",
-            "input": [
-                {"role":"system","content":"Eres editor. Devuelve SOLO HTML válido (sin html/head/body). Completa SOLO las secciones faltantes listadas, sin repetir lo existente. Máx 300–450 palabras. Sin herramientas."},
-                {"role":"user","content":"Secciones obligatorias: "+", ".join(needed)+". Faltantes: "+", ".join(missing_effective)+". Devuelve solo el HTML de esas secciones."}
-            ],
-            "max_output_tokens": 450
-        }
-        t2 = time.perf_counter()
-        r_fix1 = client.responses.create(**req_fix1)
-        t3 = time.perf_counter()
-        add = _safe_text(r_fix1)
-        add = _strip_tracking(add)
-        add = _extract_inner_html(add)
-        u_fix1 = _extract_usage(r_fix1)
-        steps.append({"name":"mini_fix_sections","usage":u_fix1,"model":"gpt-5","ms":int((t3-t2)*1000),"queries":[]})
-        txt = (txt or "").rstrip() + ("\n" if not (txt or "").endswith("\n") else "") + (add or "")
-
-    # ---------- Mini-fix 2 (≤2 búsquedas) si hay demasiados “—” ----------
-    if (dashes_costos + dashes_plazos) >= 4:
-        req_fix2 = {
-            "model": "gpt-5",
-            "tools": [{"type": "web_search_preview"}],
-            "input": [
-                {"role":"system","content":(
-                    "Eres verificador. Devuelve SOLO HTML válido (sin html/head/body) y conciso. "
-                    "Realiza **como máximo 2 búsquedas** y trae el contexto mínimo. "
-                    "Objetivo: completar montos/plazos oficiales faltantes en 'Costos y tasas' y/o 'Plazos' con enlaces oficiales. "
-                    "No reescribas todo; entrega solo la tabla o bullets que reemplacen '—'. Máx 300–350 palabras."
-                )},
-                {"role":"user","content":"Completa valores ausentes en Costos/Plazos y cita solo SENADI, WIPO u órgano andino. Devuelve bloque listo para insertar."}
-            ],
-            "max_output_tokens": 350
-        }
-        t4 = time.perf_counter()
-        r_fix2 = client.responses.create(**req_fix2)
-        t5 = time.perf_counter()
-        fill = _safe_text(r_fix2)
-        fill = _strip_tracking(fill)
-        fill = _extract_inner_html(fill)
-        u_fix2 = _extract_usage(r_fix2)
-        _, q2 = _count_web_calls(r_fix2)
-        steps.append({"name":"targeted_fill","usage":u_fix2,"model":"gpt-5","ms":int((t5-t4)*1000),"queries":q2})
-        txt = (txt or "").rstrip() + ("\n" if not (txt or "").endswith("\n") else "") + (fill or "")
-
-    # ---------- Panel de costo ----------
-    def _row(s):
-        c = _cost_from_usage(s["usage"], model_name="gpt-5", pin_override=pin_override, pout_override=pout_override)
-        return (f"<tr><td>{s['name']}</td>"
-                f"<td class='mono'>{s['usage']['input']}</td>"
-                f"<td class='mono'>{s['usage']['output']}</td>"
-                f"<td class='mono'>{s['usage']['total']}</td>"
-                f"<td class='mono'>{s['usage'].get('cached',0)} cached</td>"
-                f"<td class='mono'>{s['ms']} ms</td>"
-                f"<td class='mono'>${c['total_usd']:.6f}</td></tr>")
-
-    usage_total = _sum_usage(*[s["usage"] for s in steps])
-    cost_total = _cost_from_usage(usage_total, model_name="gpt-5", pin_override=pin_override, pout_override=pout_override)
-    rows = "".join(_row(s) for s in steps)
-    pin = cost_total["pin"]; pout = cost_total["pout"]
-
-    warn_rates = ""
-    if pin == 0.0 and pout == 0.0:
-        warn_rates = "<div class='warn mono'>Advertencia: tarifas IN/OUT = 0. Define OPENAI_PRICE_GPT5_IN / OPENAI_PRICE_GPT5_OUT o pásalas por querystring ?pin=...&pout=...</div>"
-
-    queries_html = ""
-    for s in steps:
-        if s.get("queries"):
-            items = "".join([f"<li class='mono'>{htmlmod.escape(q)}</li>" for q in s["queries"]])
-            queries_html += f"<div class='card'><h3>🔎 Queries usadas en {s['name']}</h3><ul>{items}</ul></div>"
-
-    panel = f"""
-<div class="card">
-  <h2>💸 Resumen de costo</h2>
-  <div class="grid">
-    <div class="kv"><span>Modelo</span><span class="mono">gpt-5</span></div>
-    <div class="kv"><span>Tokens (IN/OUT/TOTAL)</span><span class="mono">{usage_total['input']} / {usage_total['output']} / {usage_total['total']}</span></div>
-    <div class="kv"><span>Cached tokens (IN)</span><span class="mono">{usage_total.get('cached',0)}</span></div>
-    <div class="kv"><span>Tarifas (USD/1K)</span><span class="mono">IN ${pin:.6f} · OUT ${pout:.6f}</span></div>
-    <div class="kv"><span>Costo total</span><span class="mono"><strong>${cost_total['total_usd']:.6f}</strong></span></div>
-  </div>
-  {warn_rates}
-  <h3>Desglose por paso</h3>
-  <table class="table">
-    <thead><tr><th>Paso</th><th>IN</th><th>OUT</th><th>TOTAL</th><th>IN cached</th><th>Tiempo</th><th>Costo</th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table>
-  <p class="mono">Límites por instrucción: ≤{max_web} búsquedas iniciales; si faltan datos oficiales, pasada dirigida ≤2 búsquedas.</p>
+    # Mini UI básica
+    debug_box = f"""
+<div style="margin:12px 0;padding:10px;border:1px solid #e8edf3;border-radius:10px;font:12px ui-monospace,Menlo,Consolas;color:#4b5563;background:#fafbff">
+  <div>⏱️ {ms} ms · 🔤 tokens IN/OUT/TOTAL: {use['in']}/{use['out']}/{use['total']} (cached {use['cached']})</div>
+  <div>🔎 Queries: {"; ".join(html.escape(q) for q in qs) if qs else "—"}</div>
 </div>
-{queries_html}
 """
+    page = f"""<!doctype html><meta charset="utf-8">
+<div style="max-width:860px;margin:24px auto;padding:0 12px;font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#0b1320">
+  <h2>Registro de marca (SENADI) — Respuesta ejecutiva</h2>
+  {debug_box}
+  {html_out}
+</div>"""
+    return Response(page, mimetype="text/html; charset=utf-8")
 
-    # ---------- Render final (respuesta SIEMPRE visible) ----------
-    if not (txt or "").strip():
-        txt = "<p class='mono'>[WARN] No llegó contenido del modelo.</p>"
-    content_html = txt if _looks_html(txt) else _markdownish_to_html(txt)
-    body = "<h2>Registro de marca en Ecuador (SENADI)</h2>" + panel + content_html
-
-    raw_note = htmlmod.escape(getattr(r1, "model_dump_json", lambda:"{}")())
-    return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
+if __name__ == "__main__":
+    # flask --app app_test_marca_simple.py run --debug
+    app.run(host="0.0.0.0", port=5000, debug=True)
 
 
 
