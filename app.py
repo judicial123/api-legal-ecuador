@@ -1449,7 +1449,7 @@ def test_contexto_practico():
 
 # ============= probar 5 =============
 import time
-# --- GET /responses/testMarca (ultra-minimal mejorado: mejor prompt + más aire) ---
+# --- GET /responses/testMarca (ultra-minimal mejorado: más aire) ---
 app.view_functions.pop("responses_testMarca", None)
 
 @app.route("/responses/testMarca", methods=["GET"])
@@ -1460,7 +1460,6 @@ def responses_testMarca():
     try:
         from openai import OpenAI
     except Exception as e:
-        # Ni siquiera pudo importar: igual devolvemos HTML visible
         return Response(f"<!doctype html><meta charset='utf-8'><h2>🟢 Endpoint ok</h2><p class='mono'>openai import error:</p><pre>{htmlmod.escape(str(e))}</pre>", mimetype="text/html; charset=utf-8")
 
     # --- helpers mínimos ---
@@ -1519,14 +1518,13 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px so
         body = banner_body + "<p>⚠️ Falta <code>OPENAI_API_KEY</code> en el entorno.</p>"
         return Response(_page(body), mimetype="text/html; charset=utf-8")
 
-    # cliente
     try:
         client = OpenAI(api_key=api_key, project=project)
     except Exception as e:
         body = banner_body + "<h3>⚠️ No se pudo crear cliente OpenAI</h3><pre class='mono'>" + htmlmod.escape(str(e)) + "</pre>"
         return Response(_page(body), mimetype="text/html; charset=utf-8")
 
-    # prompt mejorado (más profundidad, pide enlaces oficiales y tablas)
+    # prompt mejorado
     SYSTEM = (
         "Eres un asesor experto en SENADI. Devuelve SOLO HTML válido en español, claro y answer-first. "
         "Puedes usar Web Search (≤7). Prioriza dominios oficiales (.gob.ec; derechosintelectuales.gob.ec / propiedadintelectual.gob.ec) y OMPI/WIPO. "
@@ -1548,14 +1546,15 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px so
         "No inventes montos/plazos; si no constan oficialmente, usa '—' y explica cómo verificar en el sitio."
     )
 
+    # MÁS AIRE: subimos el límite principal
     req = {
         "model": "gpt-5",
-        "tools": [{"type": "web_search"}],  # mantenemos la versión que te funcionó
+        "tools": [{"type": "web_search"}],
         "input": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
         ],
-        "max_output_tokens": 2800  # MÁS AIRE que antes (1600)
+        "max_output_tokens": 3600  # ⬅️ antes 1600 / 2800
     }
 
     # llamada principal
@@ -1565,25 +1564,24 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px so
         text = _safe_text(r)
         text = _strip_tracking(text)
         if not text or not text.strip():
-            # fallback sin herramientas con más aire que antes
+            # fallback sin herramientas — MÁS AIRE también
             r2 = client.responses.create(
                 model="gpt-5",
                 input=[
-                    {"role":"system","content":"Entrega AHORA la respuesta final en HTML válido (máx 1100 palabras), SIN usar herramientas, con las secciones pedidas."},
+                    {"role":"system","content":"Entrega AHORA la respuesta final en HTML válido (máx 1300 palabras), SIN usar herramientas, con las secciones pedidas."},
                     {"role":"user","content": USER},
                 ],
-                max_output_tokens=1600
+                max_output_tokens=2000  # ⬅️ antes 900/1600
             )
             text = _safe_text(r2)
             text = _strip_tracking(text)
         raw_note = htmlmod.escape(getattr(r, "model_dump_json", lambda:"{}")())
     except Exception as e:
-        # si falla todo, mostramos error pero SIEMPRE con contenido visible
         err = htmlmod.escape(str(e))
         body = banner_body + f"<h3>⚠️ Error consultando el modelo</h3><pre class='mono'>{err}</pre>"
         return Response(_page(body), mimetype="text/html; charset=utf-8")
 
-    # si aún no hay texto o quedó muy corto, contenido mínimo (para nunca quedar en blanco)
+    # si aún no hay texto o quedó muy corto, contenido mínimo
     if not text or len(re.sub(r"<[^>]+>", "", text).strip()) < 120:
         static_html = """
 <h2>🧭 Resumen rápido</h2>
