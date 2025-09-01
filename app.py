@@ -677,201 +677,7 @@ def generate_legal_response_empresario(question, context_docs, contexto_practico
     return respuesta, tokens_total
 
 
-# ============= RESPUESTA EMPRESARIO API =============
-def generate_legal_response_empresario_API(question, context_docs, contexto_practico=None):
-    """
-    Versión estilo Playground:
-    - Usa Responses API con la herramienta web_search (GPT-5).
-    - No usa context_docs ni añade ⚖️ Fundamento legal.
-    - Formato práctico con sección de “📚 Fuentes consultadas” (<ul>).
-    """
-    import os, re, html, logging
-    from urllib.parse import urlparse
 
-    # -------- Config del modelo (forzamos GPT-5; fallback a 5-mini si hace falta) --------
-    _cfg = globals().get("CONFIG", {}) if "CONFIG" in globals() else {}
-    model_preferido = _cfg.get("OPENAI_MODEL_RESPONSES") or "gpt-5"
-    if not str(model_preferido).startswith("gpt-5"):
-        model_preferido = "gpt-5"
-    model_fallback = "gpt-5-mini"
-
-    # Límite de salida razonable para mantener costo bajo en esta ruta
-    max_out = int(_cfg.get("MAX_TOKENS", 1800))
-    max_out = max(256, min(max_out, 1800))  # clamp defensivo
-
-    # -------- Cliente OpenAI (usa OPENAI_PROJECT si existe; requerido por tools en algunas cuentas) --------
-    try:
-        from openai import OpenAI
-        api_key = os.getenv("OPENAI_API_KEY")
-        project = os.getenv("OPENAI_PROJECT")
-        if not api_key:
-            return ("⚠️ Falta OPENAI_API_KEY en el entorno.", 0)
-        client = globals().get("openai_client", None)
-        if client is None or not hasattr(client, "responses"):
-            client = OpenAI(api_key=api_key, project=project) if project else OpenAI(api_key=api_key)
-    except Exception as e:
-        return ("⚠️ Falta SDK OpenAI o error creando cliente: " + str(e), 0)
-
-    # -------- Helpers --------
-    def _safe_output_text(resp):
-        """Devuelve texto aunque output_text venga vacío."""
-        txt = (getattr(resp, "output_text", "") or "").strip()
-        if txt:
-            return txt
-        parts = []
-        for item in (getattr(resp, "output", []) or []):
-            try:
-                if getattr(item, "type", "") == "message":
-                    for c in getattr(item, "content", []) or []:
-                        t = getattr(c, "text", None)
-                        if t:
-                            parts.append(t)
-            except Exception:
-                pass
-        return "\n".join(p for p in parts if p).strip()
-
-    def _mk_fuentes_html_from_urls(urls, titles=None, cap=7):
-        titles = titles or {}
-        used_domains, items = set(), []
-        for u in urls:
-            if not u:
-                continue
-            try:
-                d = urlparse(u).netloc.replace("www.", "")
-            except Exception:
-                d = ""
-            if d in used_domains:
-                continue
-            t = html.escape(titles.get(u, d or "Fuente"))
-            items.append(f'<li><a href="{html.escape(u)}" target="_blank" rel="noopener nofollow">{t}</a> — {html.escape(d or "")}</li>')
-            used_domains.add(d)
-            if len(items) >= cap:
-                break
-        return "<ul>" + "\n".join(items) + "</ul>" if items else "<p>—</p>"
-
-    def _extract_citations(resp):
-        """Recolecta URLs/títulos desde items/citations y, si falta, por regex del texto."""
-        urls, titles = [], {}
-        # 1) Intentar desde metadatos de items
-        for item in (getattr(resp, "output", []) or []):
-            try:
-                meta = {}
-                if isinstance(item, dict):
-                    meta = (item.get("citation") or item.get("metadata") or item.get("source") or {})
-                else:
-                    meta = getattr(item, "citation", None) or getattr(item, "metadata", None) or {}
-                url = (meta.get("url") or meta.get("href") or meta.get("source_url") or "").strip()
-                ttl = (meta.get("title") or meta.get("source_title") or "").strip()
-                if url and url not in urls:
-                    urls.append(url)
-                    if ttl:
-                        titles[url] = ttl
-            except Exception:
-                pass
-        # 2) Regex del texto si no hubo nada
-        text = (getattr(resp, "output_text", "") or "")
-        if not urls and text:
-            for m in re.findall(r"https?://[^\s\)\]\}<>\"']+", text):
-                if m not in urls:
-                    urls.append(m)
-        return urls, titles
-
-    # -------- Prompt estilo Playground --------
-    q = (question or "").strip()
-
-    SYSTEM = (
-        "Eres un asesor experto en trámites empresariales en Ecuador (es-EC, tz: America/Guayaquil). "
-        "Usa la herramienta Web Search de forma ACTIVA priorizando dominios oficiales "
-        "(supercias.gob.ec, sri.gob.ec, gob.ec, funcionjudicial.gob.ec, registros mercantiles). "
-        "Responde answer-first y NO inventes montos/plazos: si no están claros, escribe “—” y explica cómo obtenerlos. "
-        "FORMATO (máx 8 secciones):\n"
-        "1) 🧭 Respuesta ejecutiva (bullets, veredicto claro)\n"
-        "2) Pasos oficiales\n"
-        "3) Documentos mínimos\n"
-        "4) Costos y tasas (si hay)\n"
-        "5) Plazos típicos (si hay)\n"
-        "6) ✅ Acciones inmediatas / ❌ Errores comunes (opcional)\n"
-        "7) 🧩 Tips operativos (opcional)\n"
-        "8) 📚 Fuentes consultadas (obligatorio) como <ul> 5–7 enlaces (título + dominio), sin repetir dominio.\n"
-        "No pegues textos extensos de fuentes; sé conciso y útil."
-    )
-
-    USER = (
-        "OBJETIVO: igualar el estilo del Playground con pasos oficiales, documentos mínimos, costos/tasas y plazos, con enlaces oficiales.\n\n"
-        "PREGUNTA:\n" + q
-    )
-
-    # -------- Llamada principal (web_search) --------
-    def _call_with_model(_model, use_preview=False):
-        tool = {"type": "web_search_preview"} if use_preview else {"type": "web_search"}
-        return client.responses.create(
-            model=_model,
-            input=[{"role": "system", "content": SYSTEM},
-                   {"role": "user", "content": USER}],
-            tools=[tool],
-            max_output_tokens=max_out,   # >= 16
-            # Importante: NO enviar temperature con modelos gpt-5
-        )
-
-    tokens_total = 0
-    respuesta = ""
-    used_model = model_preferido
-    try:
-        r = _call_with_model(used_model, use_preview=False)
-    except Exception:
-        # Intento alterno con web_search_preview
-        try:
-            r = _call_with_model(used_model, use_preview=True)
-        except Exception:
-            # Fallback a gpt-5-mini con web_search
-            try:
-                used_model = model_fallback
-                r = _call_with_model(used_model, use_preview=False)
-            except Exception:
-                # Último intento: gpt-5-mini con preview
-                r = _call_with_model(used_model, use_preview=True)
-
-    # Texto y uso
-    respuesta = _safe_output_text(r)
-    try:
-        u = getattr(r, "usage", None)
-        if u:
-            tokens_total = (getattr(u, "input_tokens", 0) or 0) + (getattr(u, "output_tokens", 0) or 0)
-    except Exception:
-        pass
-
-    # Reintento sin tools si no hubo texto (síntesis mínima)
-    if not respuesta.strip():
-        r2 = client.responses.create(
-            model=used_model,
-            input=[
-                {"role": "system", "content": "Responde en el formato indicado, AUN SIN BUSCAR. Usa “—” si faltan datos."},
-                {"role": "user", "content": USER},
-            ],
-            max_output_tokens=min(max_out, 800),
-        )
-        respuesta = _safe_output_text(r2)
-        try:
-            u2 = getattr(r2, "usage", None)
-            if u2:
-                tokens_total += (getattr(u2, "input_tokens", 0) or 0) + (getattr(u2, "output_tokens", 0) or 0)
-        except Exception:
-            pass
-
-    # -------- Forzar sección de Fuentes consultadas (HTML <ul>) --------
-    # Si falta, o no hay <ul>, construimos una con URLs detectadas
-    urls, titles = _extract_citations(r)
-    fuentes_html = _mk_fuentes_html_from_urls(urls, titles, cap=7)
-
-    if "📚 Fuentes consultadas" not in respuesta:
-        respuesta = respuesta.rstrip() + "\n\n📚 Fuentes consultadas\n" + fuentes_html
-    else:
-        if "<ul>" not in respuesta:
-            # Reemplazar bloque final de fuentes por nuestra lista HTML
-            respuesta = re.sub(r"(📚\s*Fuentes consultadas\s*)[\s\S]*$",
-                               r"\\1\n" + fuentes_html, respuesta)
-
-    return respuesta, tokens_total
 
 
 
@@ -1017,76 +823,6 @@ def handle_query():
 
 
 
-# ============= ENDPOINT PRINCIPAL =============
-@app.route("/queryEmpresario", methods=["GET", "POST"])
-def handle_query_empresario():
-    try:
-        question = request.args.get("question", "").strip() if request.method == "GET" else request.get_json().get("question", "").strip()
-        if not question:
-            return jsonify({"error": "Se requiere 'question'"}), 400
-
-        # ========== CONTEXTO LEGAL ==========
-        query_engine = index.as_query_engine(similarity_top_k=TOP_K_RESULTS)
-        pinecone_response = query_engine.query(question)
-
-        context_docs = []
-        biografia_juridica = {"alta": [], "media": [], "baja": []}
-
-        total_docs = len(pinecone_response.source_nodes)
-        alta_limite = int(total_docs * 0.3)
-        media_limite = int(total_docs * 0.6)
-
-        for i, node in enumerate(pinecone_response.source_nodes):
-            metadata = getattr(node.node, 'metadata', {})
-            codigo = metadata.get('code', '')
-            articulo = metadata.get('article', '')
-            texto = getattr(node.node, 'text', '') or metadata.get("text", '')
-            texto = texto.strip()
-
-            doc_data = {"codigo": codigo, "articulo": articulo, "texto": texto}
-            context_docs.append(doc_data)
-
-            if i < alta_limite:
-                biografia_juridica["alta"].append(doc_data)
-            elif i < media_limite:
-                biografia_juridica["media"].append(doc_data)
-            else:
-                biografia_juridica["baja"].append(doc_data)
-
-      
-        # ========== RESPUESTAS ==========
-        respuesta_legal, tokens_usados = generate_legal_response_empresario_API(question, context_docs)
-
-        index_respuestas_abogados = pc.Index("indice-respuestas-abogados")
-        embedding = embed_model._get_query_embedding(question)
-        similares = index_respuestas_abogados.query(vector=embedding, top_k=1, include_metadata=True)
-
-        respuesta_practica_reformulada = None
-
-        if similares.get("matches"):
-            match = similares["matches"][0]
-            score = match.get("score", 0)
-            if score >= 0.6:
-                respuesta_practica_reformulada = obtener_respuesta_practica(question, score=score)
-            else:
-                respuesta_practica_reformulada = None
-
-        # ========== UNIFICAR RESPUESTA ==========
-        bloques = []
-
-        if respuesta_practica_reformulada:
-            bloques.append("📌 Recomendación práctica:\n" + respuesta_practica_reformulada.strip())
-
-        bloques.append("⚖️ Fundamento legal:\n" + respuesta_legal.strip())
-
-        return jsonify({
-            "respuesta": "\n\n---\n\n".join(bloques),
-            "biografia_juridica": biografia_juridica,
-            "tokens_usados": {"total_tokens": tokens_usados}
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 import tiktoken
 
@@ -1408,726 +1144,303 @@ Responde con lenguaje humano, sin tecnicismos innecesarios y sin inventar datos 
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
-# ============= ENDPOINT PRINCIPAL =============
-@app.route("/test-contexto-practico", methods=["POST"])
-def test_contexto_practico():
+# ================== HELPERS WEB ==================
+HEADERS = {"User-Agent": "Mozilla/5.0", "Accept-Language": "es-EC,es;q=0.9"}
+MENU_BLACKLIST = re.compile(
+    r"(Inicio|Biblioteca|Transparencia|Noticias|Servicios Electr[oó]nicos|"
+    r"Ciudadanos|Administraci[oó]n|Gobierno|Contacto|Men[uú]|Quipux)",
+    re.I
+)
+
+def google_searchEmpresa(query: str, num=10, hl="es", gl="EC", start=1, cx=None):
+    """
+    Llama a Google Custom Search API (Programmable Search Engine).
+    - query: la consulta
+    - num: cantidad de resultados (máx 10 por página)
+    - hl: idioma de la interfaz (es = español)
+    - gl: geolocalización (EC = Ecuador)
+    - start: índice inicial (1 = primeros resultados, 11 = segunda página, etc.)
+    - cx: ID del buscador (si no se pasa, usa GOOGLE_CX por defecto)
+    """
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "q": query,
+        "key": GOOGLE_API_KEY,
+        "cx": cx,   # ✅ usa el que te pasen o el default
+        "num": num,
+        "hl": hl,
+        "gl": gl,
+        "cr": "countryEC",
+        "start": start
+    }
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    return [it["link"] for it in data.get("items", [])]
+
+def smart_scrape(url: str, max_chars=20000) -> str:
     try:
-        data = request.get_json()
-        question = data.get("question", "").strip() if data else ""
-        if not question:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        blocks = []
+        for tag in soup.find_all(["article","section","div","p","li","td"]):
+            t = tag.get_text(" ", strip=True)
+            if not t or len(t) < 30:
+                continue
+            if MENU_BLACKLIST.search(t):
+                continue
+            link_count = len(tag.find_all("a"))
+            score = len(t) / (1 + link_count)
+            blocks.append((score, t))
+        blocks.sort(key=lambda x: x[0], reverse=True)
+        joined = " ".join([t for _, t in blocks[:120]])
+        return joined[:max_chars]
+    except Exception as e:
+        return f"[Error leyendo {url}: {e}]"
+
+def chunk_text(text, max_chars=3000, overlap=250):
+    if not text: return []
+    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    chunks, cur, cur_len = [], [], 0
+    for p in paras:
+        if cur_len + len(p) + 2 <= max_chars:
+            cur.append(p); cur_len += len(p) + 2
+        else:
+            if cur: chunks.append("\n\n".join(cur))
+            tail = ("\n\n".join(cur))[-overlap:] if cur else ""
+            cur = [tail, p] if tail else [p]
+            cur_len = len(tail) + len(p)
+    if cur: chunks.append("\n\n".join(cur))
+    return [c[:max_chars] for c in chunks]
+
+def cosine_similarity(a, b):
+    a, b = np.array(a), np.array(b)
+    return float(np.dot(a, b) / (np.linalg.norm(a)*np.linalg.norm(b) + 1e-10))
+
+
+# ================== WRITER (Responses API con GPT-5) ==================
+def ask_final_gptEmpresa(question, full_context, urls):
+    SYSTEM = (
+        "Eres un abogado empresarial en Ecuador, experto en derecho laboral, tributario y societario. "
+        "Tu tono debe ser firme, claro y seguro, como si asesoraras directamente a un gerente general. "
+        "Responde PREFERENTEMENTE con base en el contexto proporcionado.\n\n"
+        "Instrucciones clave:\n"
+        "- SI hay DOCUMENTOS LEGALES en el contexto, cítalos siempre de forma explícita con el formato [Código Art. X].\n"
+        "- Si no hay normativa aplicable, responde igual con orientación práctica y no inventes artículos.\n"
+        "- No ignores los artículos relevantes: son la base de la respuesta, pero no los uses si no aplican.\n"
+        "- Entrega la respuesta en tono profesional y categórico, evitando frases como 'no hay suficiente información'. "
+        "En su lugar, usa expresiones como 'Con base en la normativa disponible'.\n"
+        "- Estructura la respuesta en bloques claros:\n"
+        "   1) 🧭 Resumen ejecutivo: respuesta directa en 2–3 frases contundentes.\n"
+        "   2) ✅ Recomendaciones prácticas: lista de acciones claras. (Inclúyelo solo si aplica)\n"
+        "   3) ⚖️ Fundamento legal: redacta un único párrafo-resumen citando los artículos relevantes. "
+        "No enumeres ni resumas artículo por artículo, solo integra lo esencial en un texto fluido. (Inclúyelo solo si aplica)\n"
+        "- Cierra SIEMPRE con: 'Me baso en [artículos citados]' cuando hayas citado normativa; si no hay artículos aplicables, omite esa frase.\n"
+    )
+
+    USER = f"Pregunta: {question}\n\n{full_context}"
+
+    try:
+        r = openai_client.responses.create(
+            model=OPENAI_GPT5_MODEL,
+            input=[
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": USER}
+            ],
+            max_output_tokens=MAX_OUTPUT_TOKENS_WRITER
+        )
+        text = (getattr(r, "output_text", "") or "").strip()
+    except Exception as e:
+        text = f"❌ Error al generar respuesta: {e}"
+
+    # --- Si quedó vacío, relleno mínimo ---
+    if not text.strip():
+        text = "🧭 Resumen ejecutivo: —\n\n📚 Fuentes consultadas: —"
+
+    # --- Adjuntar fuentes si existen ---
+    if urls:
+        links_html = "<h2>📚 Fuentes consultadas</h2>\n<ul>\n" + \
+                     "".join(f'  <li><a href="{u}" target="_blank">{u}</a></li>\n' for u in urls) + \
+                     "</ul>"
+        text += "\n\n" + links_html
+
+    return text
+
+
+
+# ================== ENDPOINT: /queryEmpresario ==================
+@app.route("/queryEmpresario", methods=["POST"])
+def query_empresario():
+    try:
+        data = request.get_json() or {}
+        question_raw = (data.get("question") or "").strip()
+        if not question_raw:
             return jsonify({"error": "Se requiere 'question'"}), 400
 
-        index_respuestas_abogados = pc.Index("indice-respuestas-abogados")
-        embedding = embed_model._get_query_embedding(question)
+        t0 = time.perf_counter()
+        question = re.sub(r"\s+", " ", question_raw).replace("“", '"').replace("”", '"').strip()
 
-        similares = index_respuestas_abogados.query(
-            vector=embedding,
-            top_k=1,
-            include_metadata=True
+        # 1) Optimización + Clasificación
+        opt_prompt = (
+            "Eres un asistente legal ecuatoriano.\n"
+            "Tu tarea es reformular la pregunta de un gerente en una QUERY corta para Google Custom Search API (CSE).\n\n"
+            "Reglas para la query:\n"
+            "- Usa estilo palabras clave (ejemplo: 'multas empresa SRI IVA Ecuador').\n"
+            "- NO uses frases completas ni preguntas.\n"
+            "- Entre 3 y 6 palabras clave.\n"
+            "- Siempre incluye 'Ecuador'.\n"
+            "- Si es tributaria, incluye también 'SRI' y 'multa' o 'sanción'.\n"
+            "- Si es laboral, incluye 'Ministerio Trabajo'.\n"
+            "- Si es de marcas o propiedad intelectual, incluye 'SENADI'.\n"
+            "- Si es de lavado de activos o reportes financieros, incluye 'UAFE'.\n"
+            "- Evita repetir palabras innecesarias.\n"
+            "- No incluyas símbolos, signos de interrogación ni conectores.\n\n"
+            "Ejemplos:\n"
+            "Pregunta: 'sanciones si mi empresa no presenta la declaración de IVA dentro del plazo establecido?'\n"
+            "→ {\"query\":\"multas empresa SRI IVA Ecuador\", \"classification\":\"web\"}\n\n"
+            "Pregunta: '¿Qué pasa si no pago el décimo tercer sueldo a mis empleados?'\n"
+            "→ {\"query\":\"multa décimo tercer sueldo Ministerio Trabajo Ecuador\", \"classification\":\"web\"}\n\n"
+            "Pregunta: '¿Cómo registrar la marca de mi empresa en Ecuador?'\n"
+            "→ {\"query\":\"registro marca empresa SENADI Ecuador\", \"classification\":\"web\"}\n\n"
+            "Pregunta: '¿Qué sanciones aplican si no reporto operaciones a la UAFE?'\n"
+            "→ {\"query\":\"multas sanciones reporte UAFE Ecuador\", \"classification\":\"web\"}\n\n"
+            "Devuelve SOLO JSON válido, en este formato exacto:\n"
+            "{\"query\":\"...\", \"classification\":\"...\"}"
         )
 
-        if not similares.get("matches"):
-            return jsonify({"respuesta": "❌ No se encontró coincidencia."})
+        r = openai_client.chat.completions.create(
+            model=OPENAI_GPT5_MODEL,
+            messages=[
+                {"role": "system", "content": opt_prompt},
+                {"role": "user", "content": question}
+            ],
+            max_completion_tokens=MAX_COMPLETION_TOKENS_CLASSIFIER
+        )
+        try:
+            parsed = json.loads(r.choices[0].message.content)
+            query_opt = parsed.get("query", question).strip()
+            classification = parsed.get("classification", "mixto")
+        except Exception:
+            query_opt, classification = question, "mixto"
 
-        match = similares["matches"][0]
-        score = match["score"]
-        idea = match["metadata"].get("respuesta_abogado", "")
-        descripcion = match["metadata"].get("descripcion", "")
+        if "ecuador" not in query_opt.lower():
+            query_opt += " Ecuador"
 
-        contexto_practico = f'En casos como "{descripcion.lower()}" se suele actuar de la siguiente forma: {idea[:300]}...'
+        # 2) Recuperación de CÓDIGOS
+        context_docs = []
+        biografia_juridica = {"alta": [], "media": [], "baja": []}
 
+        if pinecone_enabled and classification in ("codigos", "mixto"):
+            try:
+                retriever = legal_index.as_retriever(similarity_top_k=12)
+                results = retriever.retrieve(question)
+                total_docs = len(results)
+                alta_lim = int(total_docs * 0.3)
+                media_lim = int(total_docs * 0.6)
+
+                for i, rnode in enumerate(results):
+                    meta = getattr(rnode.node, "metadata", {})
+                    codigo = meta.get("code", "") or meta.get("codigo", "")
+                    articulo = meta.get("article", "") or meta.get("articulo", "")
+                    texto = getattr(rnode.node, "text", "") or meta.get("text", "")
+                    texto = (texto or "").strip()
+                    if not (codigo and articulo and texto):
+                        continue
+                    doc = {"codigo": codigo, "articulo": articulo, "texto": texto[:600]}
+                    context_docs.append(doc)
+
+                    if i < alta_lim:
+                        biografia_juridica["alta"].append(doc)
+                    elif i < media_lim:
+                        biografia_juridica["media"].append(doc)
+                    else:
+                        biografia_juridica["baja"].append(doc)
+
+                context_docs = context_docs[:8]
+            except Exception as e:
+                biografia_juridica["error_retriever"] = str(e)
+
+        # 3) WEB (buscar en CSE oficial + CSE práctico y combinar resultados)
+        TOPK, CHUNK_MAX, CHUNK_OVERLAP = 10, 3000, 250
+        CONTEXT_HARD_CAP, MIN_CHUNKS_VALIDOS, MAX_SELECTED = 60000, 2, 12
+
+        def rank_chunks(chunks_by_url, q):
+            q_emb = embed_model.get_text_embedding(q[:2000])
+            scored = []
+            for u, chs in chunks_by_url:
+                for idx, ch in enumerate(chs):
+                    ch = (ch or "").strip()
+                    if not ch:
+                        continue
+                    if len(ch) > CHUNK_MAX:
+                        ch = ch[:CHUNK_MAX]
+                    emb = embed_model.get_text_embedding(ch)
+                    sim = cosine_similarity(q_emb, emb)
+                    scored.append((u, idx, ch, sim))
+            scored.sort(key=lambda x: x[3], reverse=True)
+            return scored
+
+        def pack_selected(selected, cap=CONTEXT_HARD_CAP):
+            out, total = [], 0
+            n = min(len(selected), MAX_SELECTED)
+            for k in range(n):
+                u, i, ch, _ = selected[k]
+                piece = f"\n\n[Fuente {u} — chunk {k+1}/{n}]\n{ch}"
+                if total + len(piece) > cap:
+                    break
+                out.append(piece)
+                total += len(piece)
+            return "".join(out), total
+
+        urls, selected_urls, final_web_context = [], [], ""
+        urls_oficial, urls_practico = [], []
+
+        if classification in ("web", "mixto"):
+            try:
+                urls_oficial = google_searchEmpresa(query_opt, num=TOPK, hl="es", gl="EC", cx=GOOGLE_CX_OFICIAL)
+                urls_practico = google_searchEmpresa(query_opt, num=TOPK, hl="es", gl="EC", cx=GOOGLE_CX_PRACTICO)
+                urls = urls_practico[:5] + urls_oficial[:5]
+
+                chunks_by_url = [
+                    (u, chunk_text(smart_scrape(u, max_chars=20000), CHUNK_MAX, CHUNK_OVERLAP))
+                    for u in urls
+                ]
+                chunks_by_url = [(u, chs) for (u, chs) in chunks_by_url if chs]
+
+                if chunks_by_url:
+                    scored = rank_chunks(chunks_by_url, question)
+                    if len(scored) >= MIN_CHUNKS_VALIDOS:
+                        selected = scored[:MAX_SELECTED]
+                        final_web_context, _ = pack_selected(selected)
+                        selected_urls = [u for u, _, _, _ in selected]
+
+            except Exception as e:
+                raise
+
+        # 4) CONTEXTO combinado
+        parts = []
+        if context_docs:
+            parts.append("DOCUMENTOS LEGALES:\n" + "\n".join(
+                f"{d['codigo']} Art.{d['articulo']}: {d['texto']}" for d in context_docs
+            ))
+        if final_web_context.strip():
+            parts.append("WEB:\n" + final_web_context)
+        context_text = "\n\n".join(parts) if parts else "—"
+
+        # 5) Respuesta final
+        answer_html = ask_final_gptEmpresa(question, context_text, selected_urls)
+
+        # ⚖️ Devolver mismo formato que /query
         return jsonify({
-            "score": score,
-            "descripcion": descripcion,
-            "respuesta_abogado": idea,
-            "contexto_practico": contexto_practico
+            "respuesta": answer_html,
+            "biografia_juridica": biografia_juridica,
+            "tokens_usados": {"total_tokens": 0}  # ⚠️ ajusta si calculas tokens
         })
 
     except Exception as e:
+        import traceback
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
-
-
-# ============= probar 5 =============
-import time
-# --- GET /responses/testMarca (ultra-minimal mejorado: aún más aire) ---
-app.view_functions.pop("responses_testMarca", None)
-
-@app.route("/responses/testMarca", methods=["GET"])
-def responses_testMarca():
-    import os, html as htmlmod, re
-    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-    from flask import Response
-    try:
-        from openai import OpenAI
-    except Exception as e:
-        return Response(f"<!doctype html><meta charset='utf-8'><h2>🟢 Endpoint ok</h2><p class='mono'>openai import error:</p><pre>{htmlmod.escape(str(e))}</pre>", mimetype="text/html; charset=utf-8")
-
-    # --- helpers mínimos ---
-    def _safe_text(resp):
-        try:
-            t = (getattr(resp, "output_text", "") or "").strip()
-            if t: return t
-        except Exception:
-            pass
-        parts = []
-        try:
-            for it in (getattr(resp, "output", []) or []):
-                if (getattr(it, "type", "") or "").lower() == "message":
-                    for c in (getattr(it, "content", []) or []):
-                        tx = getattr(c, "text", None)
-                        if tx: parts.append(tx)
-        except Exception:
-            pass
-        return "\n".join(parts).strip()
-
-    def _strip_tracking(text: str) -> str:
-        if not text: return text
-        def _clean(u):
-            try:
-                p = urlparse(u)
-                qs = [(k,v) for (k,v) in parse_qsl(p.query, keep_blank_values=True)
-                      if not (k.lower().startswith("utm_") or k.lower() in {"gclid","fbclid","ref"})]
-                return urlunparse((p.scheme,p.netloc,p.path,p.params,("&".join([f"{k}={v}" for k,v in qs]) if qs else ""),p.fragment))
-            except Exception:
-                return u
-        return re.sub(r"https?://[^\s<>\)\]\"']+", lambda m: _clean(m.group(0)), text)
-
-    def _page(body: str, note: str = "") -> str:
-        return f"""<!doctype html><html lang="es"><meta charset="utf-8">
-<style>
-body{{font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0}}
-.article{{max-width:880px;margin:24px auto;padding:24px}}
-.mono{{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#555}}
-h1,h2{{margin:.2rem 0 .6rem}}
-.banner{{background:#eef4ff;padding:12px 16px;border:1px solid #d7e3ff;border-radius:10px;margin-bottom:14px}}
-a{{color:#1b72ff}}
-pre{{white-space:pre-wrap;word-break:break-word;background:#f7f8fa;border:1px solid #e8edf3;padding:12px;border-radius:10px}}
-</style>
-<div class="article">
-  <div class="banner">🟢 <strong>Endpoint activo.</strong> Si ves esto, <em>nunca</em> es una página en blanco.</div>
-  {body}
-  {('<details><summary class="mono">debug</summary>'+note+'</details>') if note else ''}
-</div></html>"""
-
-    # --- banner + intento de modelo ---
-    banner_body = "<h2>Registro de marca en Ecuador (SENADI)</h2>"
-    api_key = os.getenv("OPENAI_API_KEY")
-    project = os.getenv("OPENAI_PROJECT")
-
-    if not api_key:
-        body = banner_body + "<p>⚠️ Falta <code>OPENAI_API_KEY</code> en el entorno.</p>"
-        return Response(_page(body), mimetype="text/html; charset=utf-8")
-
-    try:
-        client = OpenAI(api_key=api_key, project=project)
-    except Exception as e:
-        body = banner_body + "<h3>⚠️ No se pudo crear cliente OpenAI</h3><pre class='mono'>" + htmlmod.escape(str(e)) + "</pre>"
-        return Response(_page(body), mimetype="text/html; charset=utf-8")
-
-    # prompt mejorado
-    SYSTEM = (
-        "Eres un asesor experto en SENADI. Devuelve SOLO HTML válido en español, claro y answer-first. "
-        "Puedes usar Web Search (≤7). Prioriza dominios oficiales (.gob.ec; derechosintelectuales.gob.ec / propiedadintelectual.gob.ec) y OMPI/WIPO. "
-        "REGLAS: (1) Cada monto/plazo debe tener enlace oficial; si no hay fuente clara, usa '—' y añade 'Cómo verificar' con la ruta exacta en el sitio. "
-        "(2) Nada de rangos orientativos para tasas oficiales. "
-        "(3) Entrega el HTML FINAL en este mismo turno (no termines en una llamada de herramienta). "
-        "SECCIONES OBLIGATORIAS: "
-        "<h2>🧭 Resumen rápido</h2>"
-        "<h2>Pasos oficiales</h2>"
-        "<h2>Costos y tasas</h2> (si procede, tabla con Rubro | Concepto | Monto USD | Fuente)"
-        "<h2>Plazos</h2> (si procede, tabla con Etapa | Plazo | Fuente)"
-        "<h2>📚 Fuentes consultadas</h2> (5–7 enlaces, dominios únicos, preferencia oficial)"
-        "<h2>🔎 Búsquedas realizadas (≤7)</h2> (query + URL principal)."
-    )
-    USER = (
-        "Pasos, costos y plazos para registrar una marca en Ecuador (SENADI). "
-        "Incluye: Casillero virtual, Solicitudes en línea (signos distintivos), publicación en Gaceta con oposiciones (30 días hábiles), "
-        "Clasificación de Niza (OMPI), vigencia de 10 años. "
-        "No inventes montos/plazos; si no constan oficialmente, usa '—' y explica cómo verificar en el sitio."
-    )
-
-    # AIRE MUY AMPLIO
-    req = {
-        "model": "gpt-5",
-        "tools": [{"type": "web_search"}],
-        "input": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": USER},
-        ],
-        "max_output_tokens": 7200  # ⬅️ el doble (o más) que antes
-    }
-
-    # llamada principal
-    raw_note = ""
-    try:
-        r = client.responses.create(**req)
-        text = _safe_text(r)
-        text = _strip_tracking(text)
-        if not text or not text.strip():
-            # fallback sin herramientas — también con más aire
-            r2 = client.responses.create(
-                model="gpt-5",
-                input=[
-                    {"role":"system","content":"Entrega AHORA la respuesta final en HTML válido (máx 1500 palabras), SIN usar herramientas, con las secciones pedidas."},
-                    {"role":"user","content": USER},
-                ],
-                max_output_tokens=4000  # ⬅️ aumentado
-            )
-            text = _safe_text(r2)
-            text = _strip_tracking(text)
-        raw_note = htmlmod.escape(getattr(r, "model_dump_json", lambda:"{}")())
-    except Exception as e:
-        err = htmlmod.escape(str(e))
-        body = banner_body + f"<h3>⚠️ Error consultando el modelo</h3><pre class='mono'>{err}</pre>"
-        return Response(_page(body), mimetype="text/html; charset=utf-8")
-
-    # si aún no hay texto o quedó muy corto, contenido mínimo
-    if not text or len(re.sub(r"<[^>]+>", "", text).strip()) < 120:
-        static_html = """
-<h2>🧭 Resumen rápido</h2>
-<ul><li>Autoridad: SENADI. Vigencia: 10 años. Oposición: 30 días hábiles tras publicación.</li></ul>
-<h2>Pasos oficiales</h2>
-<ol>
- <li>Casillero virtual en SENADI.</li>
- <li>Solicitudes en línea → signos distintivos; completar formulario.</li>
- <li>Pagar tasa y enviar; examen de forma → Gaceta → oposiciones → examen de fondo → resolución.</li>
-</ol>
-<h2>📚 Fuentes consultadas</h2>
-<ul>
- <li><a target="_blank" rel="noopener" href="https://www.derechosintelectuales.gob.ec/como-registro-una-marca/">¿Cómo registro una marca? — SENADI</a></li>
- <li><a target="_blank" rel="noopener" href="https://www.derechosintelectuales.gob.ec/direccion-tecnica-de-signos-distintivos/">Dirección Técnica de Signos Distintivos — SENADI</a></li>
- <li><a target="_blank" rel="noopener" href="https://www.wipo.int/classifications/nice/">Clasificación de Niza — OMPI/WIPO</a></li>
-</ul>
-"""
-        body = banner_body + static_html
-        return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
-
-    body = banner_body + text
-    return Response(_page(body, note=raw_note), mimetype="text/html; charset=utf-8")
-
-# Evita colisión si ya existía
-app.view_functions.pop("responses_toolcheckFinal", None)
-
-@app.route("/responses/toolcheckFinal", methods=["GET"])
-def responses_toolcheckFinal():
-    """
-    HTML ejecutivo para cualquier pregunta gerencial (Ecuador/LATAM) con Web Search (≤7).
-    - q=...        : pregunta (default: 'como registrar una marca en ecuador')
-    - preview=1    : usa web_search_preview (si no, web_search)
-    - model=gpt-5  : modelo (default gpt-5)
-    - max=1600     : tokens de salida aprox
-
-    Devuelve: text/html con secciones: Resumen, Pasos/Plan, Costos/Plazos (si aplica),
-    Riesgos & Compliance, KPIs/Checklist (si aplica), Fuentes consultadas (5–7),
-    y Búsquedas realizadas (≤7).
-    """
-    import os, re, json, traceback
-    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-    from flask import request, Response
-    from openai import OpenAI
-
-    # ---------- Helpers ----------
-    def _safe_text(resp):
-        """Extrae texto aunque output_text venga vacío."""
-        try:
-            txt = (getattr(resp, "output_text", "") or "").strip()
-            if txt:
-                return txt
-        except Exception:
-            pass
-        parts = []
-        try:
-            for it in (getattr(resp, "output", []) or []):
-                if (getattr(it, "type", "") or "").lower() == "message":
-                    for c in (getattr(it, "content", []) or []):
-                        t = getattr(c, "text", None)
-                        if t:
-                            parts.append(t)
-        except Exception:
-            pass
-        return "\n".join([p for p in parts if p]).strip()
-
-    def _resp_to_dict(resp):
-        for attr in ("model_dump_json", "json"):
-            fn = getattr(resp, attr, None)
-            if callable(fn):
-                try:
-                    return json.loads(fn())
-                except Exception:
-                    pass
-        try:
-            d = {}
-            for k, v in resp.__dict__.items():
-                try:
-                    json.dumps(v); d[k] = v
-                except Exception:
-                    d[k] = str(v)
-            return d
-        except Exception:
-            return {"_raw": str(resp)}
-
-    def _extract_tool_queries(resp):
-        """Reconstruye queries de los tool-calls de web_search (máx. 7)."""
-        queries = []
-        for it in (getattr(resp, "output", []) or []):
-            t = (getattr(it, "type", "") or "").lower()
-            if "web" in t and "search" in t and "call" in t:
-                # Raspar posibles campos de argumentos
-                candidates = []
-                for key in ("arguments", "args", "input", "parameters", "tool_input", "tool_args"):
-                    if hasattr(it, key):
-                        candidates.append(getattr(it, key))
-                if not candidates and hasattr(it, "__dict__"):
-                    dct = dict(it.__dict__)
-                    for key in ("arguments", "args", "input", "parameters", "tool_input", "tool_args"):
-                        if key in dct:
-                            candidates.append(dct[key])
-
-                q_val = None
-                for c in candidates:
-                    try:
-                        if isinstance(c, str):
-                            obj = json.loads(c)
-                        elif isinstance(c, dict):
-                            obj = c
-                        else:
-                            obj = None
-                        if isinstance(obj, dict):
-                            for k in ("query", "q", "search_query"):
-                                if k in obj and isinstance(obj[k], str) and obj[k].strip():
-                                    q_val = obj[k].strip()
-                                    break
-                    except Exception:
-                        if isinstance(c, str) and c.strip():
-                            q_val = c.strip()
-                    if q_val:
-                        break
-                queries.append(q_val or "—")
-
-        # Dedupe preservando orden y corta a 7
-        seen, uniq = set(), []
-        for q in queries:
-            key = (q or "—").strip().lower()
-            if key not in seen:
-                seen.add(key)
-                uniq.append(q)
-        return uniq[:7]
-
-    def _strip_tracking_params_in_text(text: str) -> str:
-        """Quita utm_* y similares de URLs dentro del HTML o Markdown."""
-        if not text: return text
-        def _clean_url(u):
-            try:
-                p = urlparse(u)
-                qs = [(k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=True)
-                      if not (k.lower().startswith("utm_") or k.lower() in {"fbclid","gclid","mc_eid","mc_cid","ref"})]
-                new_q = urlencode(qs, doseq=True)
-                return urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, p.fragment))
-            except Exception:
-                return u
-        url_rx = re.compile(r"https?://[^\s<>\)\]\"']+")
-        return url_rx.sub(lambda m: _clean_url(m.group(0)), text)
-
-    def _looks_html(s: str) -> bool:
-        return bool(s and re.search(r"</?(h\d|p|ul|ol|li|div|section|article|table|thead|tbody|tr|td|th|strong|em|a)\b", s, re.I))
-
-    def _markdownish_to_html(s: str) -> str:
-        """Conversión ligera si el modelo devolviera Markdown."""
-        if not s: return ""
-        # enlaces [texto](url)
-        s = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', s)
-        # **negritas** y *itálicas*
-        s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
-        s = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", s)
-        # encabezados simples
-        s = re.sub(r"^# (.+)$", r"<h2>\1</h2>", s, flags=re.M)
-        s = re.sub(r"^## (.+)$", r"<h3>\1</h3>", s, flags=re.M)
-        # bullets
-        lines = s.splitlines()
-        html_lines, in_ul = [], False
-        for ln in lines:
-            if re.match(r"^\s*[-•]\s+", ln):
-                if not in_ul:
-                    html_lines.append("<ul>")
-                    in_ul = True
-                html_lines.append("<li>" + re.sub(r"^\s*[-•]\s+", "", ln) + "</li>")
-            else:
-                if in_ul:
-                    html_lines.append("</ul>")
-                    in_ul = False
-                if ln.strip():
-                    html_lines.append(f"<p>{ln}</p>")
-        if in_ul:
-            html_lines.append("</ul>")
-        return "\n".join(html_lines)
-
-    def _ensure_html(body: str, title: str = "Asesor Ejecutivo") -> str:
-        body = body.strip()
-        if not _looks_html(body):
-            body = _markdownish_to_html(body)
-        style = """
-<style>
-:root { --ink:#0b1320; --muted:#5b6472; --brand:#1b72ff; --bg:#ffffff; }
-html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui, -apple-system, Segoe UI, Roboto, Arial;}
-.article{max-width:880px;margin:24px auto;padding:24px;}
-h1,h2,h3{line-height:1.25;margin:18px 0 10px;}
-h1{font-size:26px} h2{font-size:22px} h3{font-size:18px}
-p,li{color:#1d2430}
-ul,ol{padding-left:22px}
-.card{background:#fff;border:1px solid #e8edf3;border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 1px 2px rgba(16,24,40,.03)}
-a{color:var(--brand);text-decoration:none}
-a:hover{text-decoration:underline}
-hr{border:none;border-top:1px solid #eef1f5;margin:18px 0}
-.badge{display:inline-block;padding:4px 10px;border-radius:999px;background:#eef4ff;color:#1b4dff;font-weight:600;font-size:12px}
-.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:var(--muted)}
-</style>"""
-        html = f"""<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title>
-{style}
-</head>
-<body>
-<article class="article">
-{body}
-</article>
-</body></html>"""
-        return html
-
-    # ---------- Client ----------
-    api_key = os.getenv("OPENAI_API_KEY"); project = os.getenv("OPENAI_PROJECT")
-    if not api_key:
-        return Response(_ensure_html("<h2>⚠️ Falta OPENAI_API_KEY</h2>"), mimetype="text/html")
-    try:
-        client = OpenAI(api_key=api_key, project=project)
-    except Exception as e:
-        return Response(_ensure_html(f"<h2>⚠️ No se pudo crear cliente OpenAI</h2><pre class='mono'>{e}</pre>"), mimetype="text/html")
-
-    # ---------- Params ----------
-    q = (request.args.get("q") or "como registrar una marca en ecuador").strip()
-    model = (request.args.get("model") or "gpt-5").strip()
-    preview = request.args.get("preview") == "1"
-    try:
-        max_out = int(request.args.get("max", "1600"))
-    except Exception:
-        max_out = 1600
-
-    # ---------- Persona/Plantilla (alta calidad, adaptable) ----------
-    SYSTEM = (
-        "Eres un ASESOR EJECUTIVO jurídico/negocios para gerentes en Ecuador y LATAM. "
-        "Devuelves SIEMPRE HTML válido (no Markdown, sin backticks). "
-        "Usas Web Search solo si ayuda (tope ≤7), con preferencia por dominios oficiales y fuentes primarias. "
-        "Reglas de contenido:\n"
-        "• Respuesta 'answer-first' y accionable; español claro.\n"
-        "• Si el tema es **trámite/ley**: incluye <h2>Costos y tasas</h2> y <h2>Plazos</h2> con montos/fechas SOLO si constan en fuentes oficiales; si no, '—'.\n"
-        "• Si el tema es **estratégico/negocio**: incluye <h2>Decisiones y alternativas</h2> y <h2>Plan 30-60-90</h2>.\n"
-        "• Siempre agrega <h2>📚 Fuentes consultadas</h2> con 5–7 enlaces únicos (preferir .gob.ec / reguladores / OMPI, etc.).\n"
-        "• Cierra con <h2>🔎 Búsquedas realizadas (≤7)</h2> listando cada query y URL principal si la hay.\n"
-        "• No inventes plazos/montos. Si no hay dato oficial claro, usa '—' y explica cómo verificar.\n"
-        "• El texto final debe ser un solo bloque HTML (no termines en tool-call)."
-    )
-    USER = (
-        f"Tarea: Redacta un informe ejecutivo para el/la gerente sobre: {q}\n"
-        "Formato recomendado (adáptalo según el tema):\n"
-        "<h2>🧭 Resumen rápido</h2>\n"
-        "<h2>Pasos / Decisiones y alternativas</h2>\n"
-        "<h2>Costos y tasas</h2>\n"
-        "<h2>Plazos</h2>\n"
-        "<h2>Riesgos & Compliance</h2>\n"
-        "<h2>KPIs & Checklist</h2>\n"
-        "<h2>📚 Fuentes consultadas</h2>\n"
-        "<h2>🔎 Búsquedas realizadas (≤7)</h2>\n"
-        "Incluye listas con <ul><li>…</li></ul> y enlaces clicables <a href='...'>…</a>."
-    )
-    tool = {"type": "web_search_preview"} if preview else {"type": "web_search"}
-
-    req = {
-        "model": model,
-        "tools": [tool],
-        "input": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": USER},
-        ],
-        "max_output_tokens": max_out  # No pasar temperature/top_p en este modelo
-    }
-
-    # ---------- Call 1: con Web Search ----------
-    try:
-        r = client.responses.create(**req)
-    except Exception as e:
-        tb = "\n".join(traceback.format_exc().splitlines()[-6:])
-        return Response(_ensure_html(f"<h2>⚠️ Error en Responses API</h2><pre class='mono'>{e}\n{tb}</pre>"), mimetype="text/html")
-
-    # Texto bruto
-    text = _safe_text(r)
-    text = _strip_tracking_params_in_text(text)
-
-    # Si quedó vacío (tool-call), forzar cierre sin herramientas
-    if not text:
-        finalize_req = {
-            "model": model,
-            "input": [
-                {"role": "system",
-                 "content": ("Entrega AHORA la respuesta final en HTML válido, clara y 'answer-first' (máx 700 palabras), "
-                             "SIN usar herramientas. Agrega '📚 Fuentes consultadas' y '🔎 Búsquedas realizadas (≤7)'.")},
-                {"role": "user", "content": USER},
-            ],
-            "max_output_tokens": max_out
-        }
-        try:
-            r2 = client.responses.create(**finalize_req)
-            text = _safe_text(r2)
-            text = _strip_tracking_params_in_text(text)
-        except Exception as e:
-            return Response(_ensure_html(f"<h2>⚠️ Fallback falló</h2><pre class='mono'>{e}</pre>"), mimetype="text/html")
-
-    # ---------- Enriquecimiento: insertar búsquedas si faltan ----------
-    def _has_busquedas_section(html: str) -> bool:
-        return bool(re.search(r"b(us|ús)quedas\s+realizadas", html, re.I))
-
-    if not _has_busquedas_section(text):
-        # reconstruye queries y agrega sección al final
-        queries = _extract_tool_queries(r)
-        if queries:
-            items = "\n".join([f"<li><strong>query:</strong> {q} <span class='mono'>| URL principal: —</span></li>" for q in queries])
-            extra = f"\n<h2>🔎 Búsquedas realizadas (≤7)</h2>\n<ul>\n{items}\n</ul>\n"
-            text = text.rstrip() + ("\n" if not text.endswith("\n") else "") + extra
-
-    # ---------- Asegurar HTML + estilos y responder ----------
-    body_html = text if _looks_html(text) else _markdownish_to_html(text)
-    full_html = _ensure_html(body_html, title="Asesor Ejecutivo")
-
-    return Response(full_html, mimetype="text/html")
-
-
-# app_test_marca_simple.py
-from flask import Flask, Response, request
-from openai import OpenAI
-import os, html, json, re, time
-
-app = Flask(__name__)
-
-def _safe_text(resp):
-    # Intenta obtener el texto final sin pelearse con la estructura del Responses API
-    try:
-        t = (getattr(resp, "output_text", "") or "").strip()
-        if t:
-            return t
-    except Exception:
-        pass
-    parts = []
-    try:
-        for it in (getattr(resp, "output", []) or []):
-            if (getattr(it, "type", "") or "").lower() == "message":
-                for c in (getattr(it, "content", []) or []):
-                    tx = getattr(c, "text", None)
-                    if tx:
-                        parts.append(tx)
-    except Exception:
-        pass
-    return "\n".join(parts).strip()
-
-def _resp_json(resp):
-    try:
-        return json.loads(getattr(resp, "model_dump_json", lambda: "{}")())
-    except Exception:
-        return {}
-
-def _usage(resp):
-    d = _resp_json(resp)
-    u = d.get("usage", {}) or {}
-    return {
-        "in": int(u.get("input_tokens") or 0),
-        "out": int(u.get("output_tokens") or 0),
-        "total": int(u.get("total_tokens") or ((u.get("input_tokens") or 0) + (u.get("output_tokens") or 0))),
-        "cached": int(((u.get("input_tokens_details") or {}).get("cached_tokens")) or 0),
-    }
-
-def _queries(resp):
-    d = _resp_json(resp)
-    out = []
-    for item in d.get("output", []) or []:
-        t = (item.get("type","") or "").lower()
-        if "web" in t and "search" in t and "call" in t:
-            args = item.get("arguments") or item.get("tool_input") or {}
-            q = None
-            for k in ("q","query","search_query"):
-                if isinstance(args.get(k), str) and args.get(k).strip():
-                    q = args.get(k).strip()
-                    break
-            if q:
-                out.append(q)
-    # único
-    seen, uniq = set(), []
-    for q in out:
-        k = q.lower()
-        if k not in seen:
-            seen.add(k)
-            uniq.append(q)
-    return uniq
-
-# app_test_marca_simple.py  (versión corregida)
-from flask import Flask, Response, request
-from openai import OpenAI
-import os, html, json, time
-
-app = Flask(__name__)
-
-def _safe_text(resp):
-    # Intenta obtener el texto final sin pelearse con la estructura del Responses API
-    try:
-        t = (getattr(resp, "output_text", "") or "").strip()
-        if t:
-            return t
-    except Exception:
-        pass
-    parts = []
-    try:
-        for it in (getattr(resp, "output", []) or []):
-            if (getattr(it, "type", "") or "").lower() == "message":
-                for c in (getattr(it, "content", []) or []):
-                    tx = getattr(c, "text", None)
-                    if tx:
-                        parts.append(tx)
-    except Exception:
-        pass
-    return "\n".join(parts).strip()
-
-def _resp_json(resp):
-    try:
-        return json.loads(getattr(resp, "model_dump_json", lambda: "{}")())
-    except Exception:
-        return {}
-
-def _usage(resp):
-    d = _resp_json(resp)
-    u = d.get("usage", {}) or {}
-    return {
-        "in": int(u.get("input_tokens") or 0),
-        "out": int(u.get("output_tokens") or 0),
-        "total": int(u.get("total_tokens") or ((u.get("input_tokens") or 0) + (u.get("output_tokens") or 0))),
-        "cached": int(((u.get("input_tokens_details") or {}).get("cached_tokens")) or 0),
-    }
-
-def _queries(resp):
-    d = _resp_json(resp)
-    out = []
-    for item in d.get("output", []) or []:
-        t = (item.get("type","") or "").lower()
-        # El Responses API etiqueta el websearch como "web.search" internamente;
-        # buscamos cualquier *call* al web search y extraemos la query si viene en arguments/tool_input
-        if "web" in t and "search" in t and "call" in t:
-            args = item.get("arguments") or item.get("tool_input") or {}
-            q = None
-            for k in ("q","query","search_query"):
-                if isinstance(args.get(k), str) and args.get(k).strip():
-                    q = args.get(k).strip()
-                    break
-            if q:
-                out.append(q)
-    # único
-    seen, uniq = set(), []
-    for q in out:
-        k = q.lower()
-        if k not in seen:
-            seen.add(k)
-            uniq.append(q)
-    return uniq
-
-@app.route("/responses/testMarcaSimple", methods=["GET"])
-def test_marca_simple():
-    from flask import request, Response
-    import os, json, html, re
-    from openai import OpenAI
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return Response("<h3>⚠️ Falta OPENAI_API_KEY</h3>", mimetype="text/html")
-    client = OpenAI(api_key=api_key, project=os.getenv("OPENAI_PROJECT"))
-
-    SYSTEM = (
-        "Eres asesor del SENADI. Devuelves SIEMPRE HTML válido (sin <html>/<body>). "
-        "Estructura obligatoria:\n"
-        "<h2>🧭 Resumen</h2>\n"
-        "<h2>Pasos oficiales</h2>\n"
-        "<h2>Costos</h2>\n"
-        "<h2>Plazos</h2>\n"
-        "<h2>Fuentes</h2>\n"
-        "Reglas: bullets breves; solo pasos, tiempos y dinero; enlaces clicables. "
-        "Prohibido inventar: si no hay monto/plazo, escribe '—' y añade 'Cómo verificar'. "
-        "Usa exclusivamente https://www.derechosintelectuales.gob.ec/como-registro-una-marca/. "
-        "Nunca termines en tool-call: siempre entrega HTML final."
-    )
-    USER = (
-        "Pregunta: ¿Cómo registrar una marca en Ecuador?\n"
-        "Fuente oficial: https://www.derechosintelectuales.gob.ec/como-registro-una-marca/\n"
-    )
-
-    def _safe_text(resp):
-        try:
-            return (getattr(resp, "output_text", "") or "").strip()
-        except:
-            return ""
-
-    def _resp_json(resp):
-        try:
-            return json.loads(getattr(resp, "model_dump_json", lambda: "{}")())
-        except:
-            return {}
-
-    # ---- Paso 1: con web_search ----
-    r1 = client.responses.create(
-        model="gpt-5",
-        tools=[{"type": "web_search"}],
-        input=[
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": USER},
-        ],
-        max_output_tokens=800,
-    )
-
-    text = _safe_text(r1)
-
-    # ---- Paso 2: fallback si no hay texto ----
-    if not text:
-        j1 = _resp_json(r1)
-        # reconstruir queries usadas (para debug)
-        queries = []
-        for it in j1.get("output", []) or []:
-            if "web" in (it.get("type") or "") and "call" in (it.get("type") or ""):
-                args = it.get("arguments") or {}
-                if isinstance(args, dict) and "query" in args:
-                    queries.append(args["query"])
-        queries_txt = "; ".join(queries) or "—"
-
-        r2 = client.responses.create(
-            model="gpt-5",
-            input=[
-                {"role": "system",
-                 "content": SYSTEM + " IMPORTANTE: ahora responde final sin usar herramientas."},
-                {"role": "user",
-                 "content": USER + "\nYa hiciste búsquedas, ahora entrega la respuesta ejecutiva final en HTML."},
-            ],
-            max_output_tokens=900,
-        )
-        text = _safe_text(r2) or "<p>No se obtuvo respuesta final.</p>"
-        text += f"<h2>🔎 Búsquedas realizadas</h2><p>{html.escape(queries_txt)}</p>"
-
-    # ---- Envolver ----
-    page = f"""<!doctype html><meta charset="utf-8">
-<div style="max-width:860px;margin:24px auto;padding:0 12px;font:16px system-ui">
-  <h2>Registro de marca (SENADI) — Respuesta ejecutiva</h2>
-  {text}
-</div>"""
-    return Response(page, mimetype="text/html; charset=utf-8")
-
-
-
-if __name__ == "__main__":
-    # flask --app app_test_marca_simple.py run --debug
-    app.run(host="0.0.0.0", port=5000, debug=True)
-
 
 
 
