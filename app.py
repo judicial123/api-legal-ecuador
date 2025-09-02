@@ -24,7 +24,12 @@ CONFIG = {
     "TEMPERATURE": 0.3,
     "MAX_TOKENS": 2000,
     "GOOGLE_SEARCH_API_KEY": os.getenv("GOOGLE_SEARCH_API_KEY"),
-    "GOOGLE_CX": os.getenv("GOOGLE_CX")
+    "GOOGLE_CX": os.getenv("GOOGLE_CX"),
+    "GOOGLE_CX_OFICIAL"= os.getenv("GOOGLE_CX_OFICIAL"),
+    "GOOGLE_CX_PRACTICO" = os.getenv("GOOGLE_CX_PRACTICO"),
+    "OPENAI_GPT5_MODEL": "gpt-5-mini",
+    "MAX_COMPLETION_TOKENS_CLASSIFIER": 160,
+    "MAX_OUTPUT_TOKENS_WRITER": 2000,
 }
 
 
@@ -218,466 +223,6 @@ Reglas de rigor:
     respuesta = (response.choices[0].message.content or "").strip()
     tokens_usados = response.usage.total_tokens if getattr(response, "usage", None) else 0
     return respuesta, tokens_usados
-
-# ===============  enpresario ===============
-
-def generate_legal_response_empresario(question, context_docs, contexto_practico=None):
-    """
-    MISMA FIRMA Y RETORNO:
-    - Params: (question, context_docs, contexto_practico=None)
-    - Return: (respuesta:str, tokens_usados:int)
-
-    Implementa flujo dinámico:
-    1) Section Planner (IA) decide 3–10 secciones útiles para gerencia (siempre incluye primero “🧭 Respuesta ejecutiva”
-       y al final “📚 Fuentes consultadas”).
-    2) Web CSE (gob.ec) para soporte operativo. Si no hay fuentes, el Writer puede usar conocimiento del modelo.
-    3) Answer Writer usa: LEGAL_FACTS (tus artículos) -> WEB -> Conocimiento del LLM (fallback).
-       Inserta citas inline [CÓDIGO Art. N] cuando aplique.
-    4) Quality Gate: verifica secciones planeadas, “answer-first”, tablas si se prometen, y fuentes (si existen).
-    5) Agrega ⚖️ Fundamento legal al final (solo con tus context_docs, con citas textuales cortas).
-    6) (Opcional) Anexa “🧩 Notas operativas (no normativo)” si se recibe `contexto_practico`.
-
-    NUEVO:
-    - Inserta al final de cada sección (excepto “📚 Fuentes consultadas”) un enlace corto “🔗 <ALIAS>”
-      a la mejor fuente .gob.ec utilizada para esa sección.
-    - Reemplaza el contenido de “📚 Fuentes consultadas” por una lista HTML <ul> con 3–7 enlaces deduplicados por dominio.
-    """
-    import os, json, re, html
-    from urllib.parse import urlparse
-    import requests
-
-    # -------- Config del modelo --------
-    model = CONFIG.get("OPENAI_MODEL", "gpt-5-mini")
-    is_gpt5 = str(model).startswith("gpt-5")
-    max_out = int(CONFIG.get("MAX_TOKENS", 2000))
-    temperature = float(CONFIG.get("TEMPERATURE", 0.3))
-
-    # -------- Config Google CSE --------
-    GOOGLE_API_KEY = CONFIG.get("GOOGLE_SEARCH_API_KEY") or os.getenv("GOOGLE_SEARCH_API_KEY")
-    GOOGLE_CX = CONFIG.get("GOOGLE_CX") or os.getenv("GOOGLE_CX")
-
-    # ===================== Helpers =====================
-
-    def _google_cse(q, n=5):
-        """Busca en gob.ec. Devuelve lista [{title,link,snippet}]."""
-        items = []
-        if not (GOOGLE_API_KEY and GOOGLE_CX):
-            return items
-        try:
-            resp = requests.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params={
-                    "key": GOOGLE_API_KEY,
-                    "cx": GOOGLE_CX,
-                    "q": q,
-                    "siteSearch": "gob.ec",
-                    "siteSearchFilter": "i",
-                    "num": min(max(n, 1), 10),
-                },
-                timeout=12,
-            )
-            data = resp.json()
-            for it in (data.get("items") or [])[:n]:
-                items.append({
-                    "title": (it.get("title") or "").strip(),
-                    "link": (it.get("link") or "").strip(),
-                    "snippet": (it.get("snippet") or "").strip()
-                })
-        except Exception:
-            pass
-        return items
-
-    def _mk_snippets(results, cap=8):
-        """Lista única por URL (máx cap)."""
-        out, seen = [], set()
-        for r in results:
-            u = r.get("link") or ""
-            if u and u not in seen:
-                out.append(r)
-                seen.add(u)
-            if len(out) >= cap:
-                break
-        return out
-
-    def _mk_web_text(snips):
-        """Bloque compacto de fuentes para el prompt del Writer."""
-        if not snips:
-            return "No se hallaron fuentes oficiales en gob.ec para esta consulta."
-        lines = []
-        for r in snips:
-            t = r.get("title", "Fuente")
-            u = r.get("link", "")
-            s = r.get("snippet", "")
-            lines.append("Título: " + t + "\nURL: " + u + "\nExtracto: " + s)
-        return "\n\n".join(lines)
-
-    def _short_quote(txt, min_w=10, max_w=25):
-        """Cita corta 10–25 palabras."""
-        if not txt:
-            return ""
-        clean = " ".join(txt.split())
-        words = clean.split(" ")
-        if len(words) <= max_w:
-            return clean
-        end = max(min_w, min(max_w, 20))
-        return " ".join(words[:end])
-
-    def _mk_fundamento(docs):
-        """Bloque final ⚖️ Fundamento legal solo con tus context_docs."""
-        articulos, usados = [], []
-        for d in docs or []:
-            codigo = (d.get("codigo") or "").strip()
-            art = (d.get("articulo") or "").strip()
-            texto = (d.get("texto") or "").strip()
-            if not (codigo and art and texto):
-                continue
-            ref = f"{codigo} Art. {art}"
-            cita = _short_quote(texto, 10, 25)
-            articulos.append(f"- [{ref}] “{html.escape(cita)}”.")
-            usados.append(ref)
-            if len(articulos) >= 6:
-                break
-        if not articulos:
-            return ""
-        cierre = "Me baso en [" + ", ".join(usados) + "]."
-        return "⚖️ Fundamento legal\n" + "\n".join(articulos) + "\n\n" + cierre
-
-    def _allowed_refs_from_docs(docs):
-        """Lista de referencias válidas 'CÓDIGO Art. N' para validar citas inline (si lo usas)."""
-        refs = []
-        for d in docs or []:
-            codigo = (d.get("codigo") or "").strip()
-            art = (d.get("articulo") or "").strip()
-            if codigo and art:
-                refs.append(f"{codigo} Art. {art}")
-        return set(refs)
-
-    def _compact_legal_text(docs, cap=12):
-        """Bloque compacto de artículos para el Writer (no URLs)."""
-        lines = []
-        for d in (docs or [])[:cap]:
-            cod = (d.get("codigo") or "").strip()
-            art = (d.get("articulo") or "").strip()
-            txt = (d.get("texto") or "").strip()
-            if cod and art and txt:
-                lines.append(f"{cod} Art.{art}: {txt[:600]}")
-        return "\n".join(lines) if lines else "(sin documentos)"
-
-    def _answer_first_ok(txt):
-        """Valida que la primera viñeta de 🧭 Respuesta ejecutiva tome postura clara."""
-        m = re.search(r"🧭\s*Respuesta\s+ejecutiva\s*(.+?)(?:\n\n[^\n]|$)", txt, flags=re.IGNORECASE | re.DOTALL)
-        sec = m.group(1) if m else ""
-        fb = re.search(r"^\s*[-•]\s*(.+)$", sec, flags=re.MULTILINE)
-        if not fb:
-            return False
-        bullet = fb.group(1).strip().lower()
-        keywords = ["sí", "si,", "no", "depende", "es legal", "no es legal", "permitido", "prohibido", "puedes", "no puedes"]
-        return any(k in bullet for k in keywords)
-
-    def _has_markdown_table(txt):
-        """Chequea si hay una tabla Markdown básica en el texto."""
-        return bool(re.search(r"^\|.+\|\s*\n\|[-:\s|]+\|\s*\n(\|.*\|\s*\n)+", txt, flags=re.MULTILINE))
-
-    # ---------- NUEVOS helpers para enlaces por sección ----------
-
-    STOP_ES = {"de","la","las","los","un","una","uno","y","o","u","para","por","con","sin","del","al","en","que","como","cuando","donde","cuál","cuáles","segun","ante","entre","hacia","hasta","sobre","tras","este","esta","esto"}
-
-    def _domain_alias(url: str) -> str:
-        """Devuelve alias corto para dominios gob.ec (SRI, IESS, MDT, SENADI…)."""
-        try:
-            d = urlparse(url).netloc.lower().replace("www.", "")
-        except Exception:
-            return "FUENTE"
-        mapping = {
-            "sri.gob.ec": "SRI",
-            "iess.gob.ec": "IESS",
-            "trabajo.gob.ec": "MDT",
-            "ministeriodeltrabajo.gob.ec": "MDT",
-            "derechosintelectuales.gob.ec": "SENADI",
-            "snai.gob.ec": "SNAI",
-            "uafe.gob.ec": "UAFE",
-            "sercop.gob.ec": "SERCOP",
-            "registrocivil.gob.ec": "REGISTRO CIVIL",
-            "funcionjudicial.gob.ec": "FUNCIÓN JUDICIAL",
-            "corteconstitucional.gob.ec": "CORTE CONSTITUCIONAL",
-            "ant.gob.ec": "ANT",
-            "arcotel.gob.ec": "ARCOTEL",
-            "arcsa.gob.ec": "ARCSA",
-            "senescyt.gob.ec": "SENESCYT",
-            "aduana.gob.ec": "SENAE",
-        }
-        if d in mapping:
-            return mapping[d]
-        # Si es .gob.ec: usa subdominio como alias (ej. "midena.gob.ec" -> "MIDENA")
-        return (d.split(".")[0].upper() if d.endswith(".gob.ec") else d.upper())
-
-    def _norm_terms(text: str) -> set:
-        t = re.sub(r"[^a-záéíóúñü0-9 ]+", " ", (text or "").lower())
-        return {w for w in t.split() if len(w) > 2 and w not in STOP_ES}
-
-    def _best_snippet_for(section_text: str, snips: list, min_overlap: int = 2):
-        """Escoge el snippet web más afín a la sección por solapamiento de términos."""
-        st = _norm_terms(section_text)
-        best, score = None, 0
-        for sn in snips or []:
-            mix = " ".join([sn.get("title",""), sn.get("snippet","")])
-            sc = len(st & _norm_terms(mix))
-            if sc > score:
-                best, score = sn, sc
-        return best if score >= min_overlap else None
-
-    def _split_by_sections(respuesta: str, sections: list):
-        """Encuentra offsets de cada sección por el título exacto (línea completa)."""
-        hits = []
-        for s in sections:
-            m = re.search(r"^" + re.escape(s) + r"\s*$", respuesta, flags=re.MULTILINE)
-            if m: hits.append((s, m.start()))
-        hits.sort(key=lambda x: x[1])
-        chunks = []
-        for i, (s, start) in enumerate(hits):
-            end = hits[i+1][1] if i+1 < len(hits) else len(respuesta)
-            chunks.append((s, start, end))
-        return chunks
-
-    def _attach_links_at_section_ends(respuesta: str, sections: list, snips: list) -> str:
-        """Añade '🔗 <alias>' con enlace al final de cada sección (excepto Fuentes)."""
-        chunks = _split_by_sections(respuesta, sections)
-        if not chunks:
-            return respuesta
-        used = set()
-        new_parts, last_end = [], 0
-        for (title, start, end) in chunks:
-            # Copia lo previo sin tocar
-            new_parts.append(respuesta[last_end:start])
-            segment = respuesta[start:end]
-            if title.strip() != "📚 Fuentes consultadas":
-                # Evitar reutilizar el mismo link en muchas secciones
-                remaining = [r for r in (snips or []) if (r.get("link") or "") not in used]
-                cand = _best_snippet_for(segment, remaining)
-                if cand and cand.get("link"):
-                    alias = _domain_alias(cand["link"])
-                    link_html = f'\n\n🔗 <a href="{html.escape(cand["link"])}" target="_blank" rel="noopener nofollow">{html.escape(alias)}</a>'
-                    segment = segment.rstrip() + link_html + "\n"
-                    used.add(cand["link"])
-            new_parts.append(segment)
-            last_end = end
-        new_parts.append(respuesta[last_end:])
-        return "".join(new_parts)
-
-    def _mk_fuentes_html(snips, cap=7):
-        """Lista HTML de fuentes (deduplicadas por dominio)."""
-        if not snips:
-            return "<p>—</p>"
-        used_domains, items = set(), []
-        for r in snips:
-            u = (r.get("link") or "").strip()
-            if not u:
-                continue
-            d = urlparse(u).netloc.replace("www.", "")
-            if d in used_domains:
-                continue
-            t = html.escape(r.get("title") or d)
-            items.append(f'<li><a href="{html.escape(u)}" target="_blank" rel="noopener nofollow">{t}</a> — {html.escape(d)}</li>')
-            used_domains.add(d)
-            if len(items) >= cap:
-                break
-        return "<ul>" + "\n".join(items) + "</ul>"
-
-    # ===================== Inicio del flujo =====================
-    tokens_total = 0
-    q = (question or "").strip()
-
-    # ---------- A) SECTION PLANNER (elige 3–10 secciones) ----------
-    planner_system = (
-        "Eres un planificador de respuesta para un gerente en Ecuador. "
-        "Elige ENTRE 3 Y 10 secciones con títulos claros (máx 35 caracteres cada uno) que mejor respondan la pregunta. "
-        "SIEMPRE incluye como primera sección '🧭 Respuesta ejecutiva' y como última '📚 Fuentes consultadas'. "
-        "Si el tema requiere plazos/responsables, incluye una sección con tabla. "
-        "Devuelve SOLO JSON válido con: {\"sections\": [\"título1\", ...]} "
-        "(no agregues comentarios)."
-    )
-    planner_user = 'Pregunta: """' + q + '"""'
-
-    kwargs_pl = dict(model=model, messages=[
-        {"role": "system", "content": planner_system},
-        {"role": "user", "content": planner_user}
-    ])
-    if is_gpt5:
-        kwargs_pl["max_completion_tokens"] = 180
-    else:
-        kwargs_pl["temperature"] = max(0.2, temperature - 0.1)
-        kwargs_pl["max_tokens"] = 180
-
-    try:
-        pl = openai_client.chat.completions.create(**kwargs_pl)
-        plan_txt = (pl.choices[0].message.content or "").strip()
-        tokens_total += pl.usage.total_tokens if getattr(pl, "usage", None) else 0
-        try:
-            plan = json.loads(plan_txt)
-            sections = [s.strip() for s in (plan.get("sections") or []) if isinstance(s, str) and s.strip()]
-        except Exception:
-            sections = []
-    except Exception:
-        sections = []
-
-    # Salvaguardas: garantizar cabeceras mínimas
-    if not sections:
-        sections = ["🧭 Respuesta ejecutiva", "🗓️ Plazos y responsables", "💸 Multas y riesgos", "✅ Acciones inmediatas", "🧾 Checklist", "❌ Errores comunes", "📚 Fuentes consultadas"]
-    # Normalizar y recortar 3–10
-    if sections[0] != "🧭 Respuesta ejecutiva":
-        sections = ["🧭 Respuesta ejecutiva"] + [s for s in sections if s != "🧭 Respuesta ejecutiva"]
-    if "📚 Fuentes consultadas" not in sections:
-        sections.append("📚 Fuentes consultadas")
-    if len(sections) < 3:
-        sections = sections + ["✅ Acciones inmediatas"]
-    sections = sections[:10]
-    if sections[-1] != "📚 Fuentes consultadas":
-        sections = [s for s in sections if s != "📚 Fuentes consultadas"]
-        sections.append("📚 Fuentes consultadas")
-
-    # Detecta si hay una sección que implique tabla (por nombre)
-    wants_table = any(any(k in s.lower() for k in ["plazo", "tabla", "responsable"]) for s in sections)
-
-    # ---------- B) FUENTES: LEGAL_FACTS + WEB (gob.ec) ----------
-    legal_facts_text = _compact_legal_text(context_docs)
-    allowed_refs = _allowed_refs_from_docs(context_docs)  # (por si validas las citas inline)
-
-    # WEB: Queries base (planner no retorna queries; usamos heurística + pregunta)
-    queries = [
-        q,
-        q + " site:gob.ec",
-        q + " site:trabajo.gob.ec",
-        q + " site:iess.gob.ec",
-        q + " site:sri.gob.ec",
-        q + " site:derechosintelectuales.gob.ec",
-    ]
-    # Heurística temática simple
-    ql = q.lower()
-    if any(p in ql for p in ["contrato", "despido", "jornada", "sut", "ministerio", "trabajo"]):
-        queries.append(q + " procedimiento site:trabajo.gob.ec")
-    if any(p in ql for p in ["iess", "afili", "aporte"]):
-        queries.append(q + " site:iess.gob.ec")
-    if any(p in ql for p in ["iva", "retención", "rdep", "ats", "sri", "formulario"]):
-        queries.append(q + " site:sri.gob.ec")
-
-    all_results = []
-    for search_q in queries[:6]:
-        all_results.extend(_google_cse(search_q, n=4))
-    web_snippets = _mk_snippets(all_results, cap=8)
-    web_context_text = _mk_web_text(web_snippets)
-
-    # ---------- C) ANSWER WRITER ----------
-    writer_system = (
-        "Eres un abogado corporativo ecuatoriano para gerentes. "
-        "Responde ‘answer-first’ y llena TODAS las secciones listadas por el plan. "
-        "Prioridad de información: 1) LEGAL_FACTS (tus artículos). 2) WEB_SNIPPETS (gob.ec). 3) Conocimiento propio si no hay fuentes. "
-        "Si aplicas una regla de LEGAL_FACTS, cierra la oración con [CÓDIGO Art. N]. "
-        "Si falta un dato, usa “—” en vez de inventar. "
-        "No coloques enlaces en el cuerpo; las referencias web se añadirán automáticamente al final de cada sección. "
-        "En '📚 Fuentes consultadas', lista 3–7 títulos + dominio (sin repetir dominios). "
-        "Si no hay ninguna fuente web válida, igualmente escribe la respuesta basada en conocimiento general y coloca '—' en Fuentes."
-    )
-    writer_user = (
-        "PREGUNTA:\n" + q +
-        "\n\nSECCIONES_PLAN (usa EXACTAMENTE estos encabezados, en orden):\n" + "\n".join(["- " + s for s in sections]) +
-        "\n\nLEGAL_FACTS (usa como primera prioridad y cita inline [CÓDIGO Art. N] cuando corresponda):\n" + legal_facts_text +
-        "\n\nWEB_SNIPPETS (solo gob.ec; si está vacío, puedes usar conocimiento del modelo):\n" + web_context_text +
-        ("\n\nREQUISITO_TABLA: sí" if wants_table else "\n\nREQUISITO_TABLA: no") +
-        "\n\nREGLAS DURAS:\n- No inventes montos/plazos.\n- Usa “—” si un dato no aparece.\n- Tono profesional, directo, orientado a decisión.\n"
-    )
-
-    kwargs_w = dict(model=model, messages=[
-        {"role": "system", "content": writer_system},
-        {"role": "user", "content": writer_user}
-    ])
-    if is_gpt5:
-        kwargs_w["max_completion_tokens"] = max_out
-    else:
-        kwargs_w["temperature"] = temperature
-        kwargs_w["max_tokens"] = max_out
-
-    wr = openai_client.chat.completions.create(**kwargs_w)
-    respuesta = (wr.choices[0].message.content or "").strip()
-    tokens_total += wr.usage.total_tokens if getattr(wr, "usage", None) else 0
-
-    # ---------- D) QUALITY GATE ----------
-    # 1) Todas las secciones del plan presentes (en orden flexible pero con todos los títulos exactos)
-    missing = []
-    for s in sections:
-        if re.search(r"^" + re.escape(s) + r"\s*$", respuesta, flags=re.IGNORECASE | re.MULTILINE) is None:
-            missing.append(s)
-
-    # 2) Answer-first en la primera viñeta
-    needs_answer_first = not _answer_first_ok(respuesta)
-
-    # 3) Si se prometió tabla, verificar que exista al menos una tabla Markdown
-    needs_table = wants_table and (not _has_markdown_table(respuesta))
-
-    if missing or needs_answer_first or needs_table:
-        problems = []
-        if missing: problems.append("Faltan secciones: " + ", ".join(missing))
-        if needs_answer_first: problems.append("La primera viñeta de ‘🧭 Respuesta ejecutiva’ no toma postura clara.")
-        if needs_table: problems.append("Se prometió tabla de plazos/responsables pero no se encontró una tabla.")
-
-        fix_system = (
-            "Corrige la respuesta para cumplir EXACTAMENTE con el plan de secciones y reglas. "
-            "Mantén el contenido ya correcto; añade o ajusta solo lo necesario. "
-            "Si prometiste tabla de plazos/responsables, incluye una tabla Markdown. "
-            "La primera viñeta de '🧭 Respuesta ejecutiva' debe tomar postura clara (‘Sí, con condiciones…’, ‘No, porque…’, ‘Depende: si… entonces…’). "
-            "No inventes datos: usa “—” si falta."
-        )
-        fix_user = (
-            "; ".join(problems) +
-            "\n\nSECCIONES_PLAN:\n" + "\n".join(["- " + s for s in sections]) +
-            ("\n\nREQUISITO_TABLA: sí" if wants_table else "\n\nREQUISITO_TABLA: no") +
-            "\n\nRespuesta actual:\n" + respuesta
-        )
-        kwargs_fix = dict(model=model, messages=[
-            {"role": "system", "content": fix_system},
-            {"role": "user", "content": fix_user}
-        ])
-        if is_gpt5:
-            kwargs_fix["max_completion_tokens"] = max_out
-        else:
-            kwargs_fix["temperature"] = max(0.2, temperature - 0.1)
-            kwargs_fix["max_tokens"] = max_out
-
-        wr2 = openai_client.chat.completions.create(**kwargs_fix)
-        fixed = (wr2.choices[0].message.content or "").strip()
-        if fixed:
-            respuesta = fixed
-            tokens_total += wr2.usage.total_tokens if getattr(wr2, "usage", None) else 0
-
-    # ---------- E) Enlaces por sección + Fuentes HTML ----------
-    # Inserta "🔗 <ALIAS>" al final de cada sección (excepto la de fuentes)
-    respuesta = _attach_links_at_section_ends(respuesta, sections, web_snippets)
-
-    # Reemplaza el contenido de “📚 Fuentes consultadas” con lista HTML
-    fuentes_html = _mk_fuentes_html(web_snippets, cap=7)
-    new_respuesta = re.sub(r"(📚\s*Fuentes consultadas\s*)[\s\S]*$", r"\1\n" + fuentes_html, respuesta)
-    if new_respuesta == respuesta:
-        # Por si acaso no encontró la sección (no debería pasar), la agregamos al final
-        respuesta = respuesta.rstrip() + "\n\n📚 Fuentes consultadas\n" + fuentes_html
-    else:
-        respuesta = new_respuesta
-
-    # ---------- F) Notas operativas (opcional) ----------
-    if contexto_practico:
-        respuesta += "\n\n🧩 Notas operativas (no normativo)\n" + (contexto_practico.strip()[:1200])
-
-    # ---------- G) Fundamento legal (tus context_docs) ----------
-    if context_docs:
-        bloque = _mk_fundamento(context_docs)
-        if bloque:
-            # si el Writer hubiera agregado uno propio (no debería), lo removemos y ponemos el nuestro
-            if "⚖️ Fundamento legal" in respuesta:
-                respuesta = re.split(r"\n?⚖️ Fundamento legal.*", respuesta, maxsplit=1)[0].rstrip()
-            respuesta += "\n\n" + bloque
-
-    return respuesta, tokens_total
-
-
-
 
 
 
@@ -1145,6 +690,16 @@ Responde con lenguaje humano, sin tecnicismos innecesarios y sin inventar datos 
 
 
 # ================== HELPERS WEB ==================
+# ================== EMPRESARIO: HELPERS + ENDPOINT ==================
+# (PÉGALO TAL CUAL EN TU ARCHIVO PRINCIPAL)
+
+import time, json
+import numpy as np
+import re
+from bs4 import BeautifulSoup
+import requests
+
+# ---- Helpers de scraping (no estaban en tu main) ----
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept-Language": "es-EC,es;q=0.9"}
 MENU_BLACKLIST = re.compile(
     r"(Inicio|Biblioteca|Transparencia|Noticias|Servicios Electr[oó]nicos|"
@@ -1154,19 +709,22 @@ MENU_BLACKLIST = re.compile(
 
 def google_searchEmpresa(query: str, num=10, hl="es", gl="EC", start=1, cx=None):
     """
-    Llama a Google Custom Search API (Programmable Search Engine).
-    - query: la consulta
-    - num: cantidad de resultados (máx 10 por página)
-    - hl: idioma de la interfaz (es = español)
-    - gl: geolocalización (EC = Ecuador)
-    - start: índice inicial (1 = primeros resultados, 11 = segunda página, etc.)
-    - cx: ID del buscador (si no se pasa, usa GOOGLE_CX por defecto)
+    Google Custom Search (Programmable Search Engine).
+    Usa tus claves quemadas en CONFIG para evitar conflictos con env vars.
     """
+    key = CONFIG.get("GOOGLE_SEARCH_API_KEY") or CONFIG.get("GOOGLE_API_KEY")
+    if not key:
+        raise RuntimeError("Falta GOOGLE_SEARCH_API_KEY/GOOGLE_API_KEY en CONFIG")
+
+    cx = cx or CONFIG.get("GOOGLE_CX")
+    if not cx:
+        raise RuntimeError("Falta GOOGLE_CX en CONFIG")
+
     url = "https://www.googleapis.com/customsearch/v1"
     params = {
         "q": query,
-        "key": GOOGLE_API_KEY,
-        "cx": cx,   # ✅ usa el que te pasen o el default
+        "key": key,
+        "cx": cx,
         "num": num,
         "hl": hl,
         "gl": gl,
@@ -1200,7 +758,8 @@ def smart_scrape(url: str, max_chars=20000) -> str:
         return f"[Error leyendo {url}: {e}]"
 
 def chunk_text(text, max_chars=3000, overlap=250):
-    if not text: return []
+    if not text:
+        return []
     paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
     chunks, cur, cur_len = [], [], 0
     for p in paras:
@@ -1218,8 +777,7 @@ def cosine_similarity(a, b):
     a, b = np.array(a), np.array(b)
     return float(np.dot(a, b) / (np.linalg.norm(a)*np.linalg.norm(b) + 1e-10))
 
-
-# ================== WRITER (Responses API con GPT-5) ==================
+# ---- Writer final (usa Responses API, modelo GPT-5 que agregarás a CONFIG) ----
 def ask_final_gptEmpresa(question, full_context, urls):
     SYSTEM = (
         "Eres un abogado empresarial en Ecuador, experto en derecho laboral, tributario y societario. "
@@ -1238,38 +796,33 @@ def ask_final_gptEmpresa(question, full_context, urls):
         "No enumeres ni resumas artículo por artículo, solo integra lo esencial en un texto fluido. (Inclúyelo solo si aplica)\n"
         "- Cierra SIEMPRE con: 'Me baso en [artículos citados]' cuando hayas citado normativa; si no hay artículos aplicables, omite esa frase.\n"
     )
-
     USER = f"Pregunta: {question}\n\n{full_context}"
 
     try:
         r = openai_client.responses.create(
-            model=OPENAI_GPT5_MODEL,
+            model=CONFIG["OPENAI_GPT5_MODEL"],
             input=[
                 {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": USER}
             ],
-            max_output_tokens=MAX_OUTPUT_TOKENS_WRITER
+            max_output_tokens=CONFIG["MAX_OUTPUT_TOKENS_WRITER"]
         )
         text = (getattr(r, "output_text", "") or "").strip()
     except Exception as e:
         text = f"❌ Error al generar respuesta: {e}"
 
-    # --- Si quedó vacío, relleno mínimo ---
     if not text.strip():
         text = "🧭 Resumen ejecutivo: —\n\n📚 Fuentes consultadas: —"
 
-    # --- Adjuntar fuentes si existen ---
     if urls:
         links_html = "<h2>📚 Fuentes consultadas</h2>\n<ul>\n" + \
                      "".join(f'  <li><a href="{u}" target="_blank">{u}</a></li>\n' for u in urls) + \
                      "</ul>"
         text += "\n\n" + links_html
-
     return text
 
 
-
-# ================== ENDPOINT: /queryEmpresario ==================
+# ---- ENDPOINT /queryEmpresario (reutiliza tu 'index' y 'embed_model' ya creados) ----
 @app.route("/queryEmpresario", methods=["POST"])
 def query_empresario():
     try:
@@ -1278,10 +831,9 @@ def query_empresario():
         if not question_raw:
             return jsonify({"error": "Se requiere 'question'"}), 400
 
-        t0 = time.perf_counter()
         question = re.sub(r"\s+", " ", question_raw).replace("“", '"').replace("”", '"').strip()
 
-        # 1) Optimización + Clasificación
+        # 1) Optimización + Clasificación (usa GPT-5 sin temperature)
         opt_prompt = (
             "Eres un asistente legal ecuatoriano.\n"
             "Tu tarea es reformular la pregunta de un gerente en una QUERY corta para Google Custom Search API (CSE).\n\n"
@@ -1310,12 +862,12 @@ def query_empresario():
         )
 
         r = openai_client.chat.completions.create(
-            model=OPENAI_GPT5_MODEL,
+            model=CONFIG["OPENAI_GPT5_MODEL"],
             messages=[
                 {"role": "system", "content": opt_prompt},
                 {"role": "user", "content": question}
             ],
-            max_completion_tokens=MAX_COMPLETION_TOKENS_CLASSIFIER
+            max_completion_tokens=CONFIG["MAX_COMPLETION_TOKENS_CLASSIFIER"]
         )
         try:
             parsed = json.loads(r.choices[0].message.content)
@@ -1327,41 +879,38 @@ def query_empresario():
         if "ecuador" not in query_opt.lower():
             query_opt += " Ecuador"
 
-        # 2) Recuperación de CÓDIGOS
+        # 2) Recuperación de CÓDIGOS desde tu índice existente
         context_docs = []
         biografia_juridica = {"alta": [], "media": [], "baja": []}
 
-        if pinecone_enabled and classification in ("codigos", "mixto"):
-            try:
-                retriever = legal_index.as_retriever(similarity_top_k=12)
-                results = retriever.retrieve(question)
-                total_docs = len(results)
-                alta_lim = int(total_docs * 0.3)
-                media_lim = int(total_docs * 0.6)
+        if classification in ("codigos", "mixto"):
+            retriever = index.as_retriever(similarity_top_k=12)
+            results = retriever.retrieve(question)
+            total_docs = len(results)
+            alta_lim = int(total_docs * 0.3)
+            media_lim = int(total_docs * 0.6)
 
-                for i, rnode in enumerate(results):
-                    meta = getattr(rnode.node, "metadata", {})
-                    codigo = meta.get("code", "") or meta.get("codigo", "")
-                    articulo = meta.get("article", "") or meta.get("articulo", "")
-                    texto = getattr(rnode.node, "text", "") or meta.get("text", "")
-                    texto = (texto or "").strip()
-                    if not (codigo and articulo and texto):
-                        continue
-                    doc = {"codigo": codigo, "articulo": articulo, "texto": texto[:600]}
-                    context_docs.append(doc)
+            for i, rnode in enumerate(results):
+                meta = getattr(rnode.node, "metadata", {})
+                codigo = meta.get("code", "") or meta.get("codigo", "")
+                articulo = meta.get("article", "") or meta.get("articulo", "")
+                texto = getattr(rnode.node, "text", "") or meta.get("text", "")
+                texto = (texto or "").strip()
+                if not (codigo and articulo and texto):
+                    continue
+                doc = {"codigo": codigo, "articulo": articulo, "texto": texto[:600]}
+                context_docs.append(doc)
 
-                    if i < alta_lim:
-                        biografia_juridica["alta"].append(doc)
-                    elif i < media_lim:
-                        biografia_juridica["media"].append(doc)
-                    else:
-                        biografia_juridica["baja"].append(doc)
+                if i < alta_lim:
+                    biografia_juridica["alta"].append(doc)
+                elif i < media_lim:
+                    biografia_juridica["media"].append(doc)
+                else:
+                    biografia_juridica["baja"].append(doc)
 
-                context_docs = context_docs[:8]
-            except Exception as e:
-                biografia_juridica["error_retriever"] = str(e)
+            context_docs = context_docs[:8]
 
-        # 3) WEB (buscar en CSE oficial + CSE práctico y combinar resultados)
+        # 3) WEB (CSE oficial + práctico)
         TOPK, CHUNK_MAX, CHUNK_OVERLAP = 10, 3000, 250
         CONTEXT_HARD_CAP, MIN_CHUNKS_VALIDOS, MAX_SELECTED = 60000, 2, 12
 
@@ -1393,30 +942,25 @@ def query_empresario():
                 total += len(piece)
             return "".join(out), total
 
-        urls, selected_urls, final_web_context = [], [], ""
-        urls_oficial, urls_practico = [], []
-
+        urls, selected_urls, final_web_context = [], [], []
         if classification in ("web", "mixto"):
-            try:
-                urls_oficial = google_searchEmpresa(query_opt, num=TOPK, hl="es", gl="EC", cx=GOOGLE_CX_OFICIAL)
-                urls_practico = google_searchEmpresa(query_opt, num=TOPK, hl="es", gl="EC", cx=GOOGLE_CX_PRACTICO)
-                urls = urls_practico[:5] + urls_oficial[:5]
+            urls_oficial = google_searchEmpresa(query_opt, num=TOPK, hl="es", gl="EC", cx=CONFIG["GOOGLE_CX_OFICIAL"])
+            urls_practico = google_searchEmpresa(query_opt, num=TOPK, hl="es", gl="EC", cx=CONFIG["GOOGLE_CX_PRACTICO"])
+            urls = urls_practico[:5] + urls_oficial[:5]
 
-                chunks_by_url = [
-                    (u, chunk_text(smart_scrape(u, max_chars=20000), CHUNK_MAX, CHUNK_OVERLAP))
-                    for u in urls
-                ]
-                chunks_by_url = [(u, chs) for (u, chs) in chunks_by_url if chs]
+            chunks_by_url = [
+                (u, chunk_text(smart_scrape(u, max_chars=20000), CHUNK_MAX, CHUNK_OVERLAP))
+                for u in urls
+            ]
+            chunks_by_url = [(u, chs) for (u, chs) in chunks_by_url if chs]
 
-                if chunks_by_url:
-                    scored = rank_chunks(chunks_by_url, question)
-                    if len(scored) >= MIN_CHUNKS_VALIDOS:
-                        selected = scored[:MAX_SELECTED]
-                        final_web_context, _ = pack_selected(selected)
-                        selected_urls = [u for u, _, _, _ in selected]
-
-            except Exception as e:
-                raise
+            if chunks_by_url:
+                scored = rank_chunks(chunks_by_url, question)
+                if len(scored) >= MIN_CHUNKS_VALIDOS:
+                    selected = scored[:MAX_SELECTED]
+                    web_context, _ = pack_selected(selected)
+                    final_web_context = web_context
+                    selected_urls = [u for u, _, _, _ in selected]
 
         # 4) CONTEXTO combinado
         parts = []
@@ -1424,23 +968,24 @@ def query_empresario():
             parts.append("DOCUMENTOS LEGALES:\n" + "\n".join(
                 f"{d['codigo']} Art.{d['articulo']}: {d['texto']}" for d in context_docs
             ))
-        if final_web_context.strip():
+        if isinstance(final_web_context, str) and final_web_context.strip():
             parts.append("WEB:\n" + final_web_context)
         context_text = "\n\n".join(parts) if parts else "—"
 
         # 5) Respuesta final
         answer_html = ask_final_gptEmpresa(question, context_text, selected_urls)
 
-        # ⚖️ Devolver mismo formato que /query
         return jsonify({
             "respuesta": answer_html,
             "biografia_juridica": biografia_juridica,
-            "tokens_usados": {"total_tokens": 0}  # ⚠️ ajusta si calculas tokens
+            "tokens_usados": {"total_tokens": 0}
         })
 
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+# ================== FIN EMPRESARIO ==================
+
 
 
 
